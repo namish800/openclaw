@@ -1919,3 +1919,329 @@ packages/coworker_api/
 | No threading model | `ThreadingAdapter` per channel | Discord threads, Slack threads, Telegram reply chains |
 | No group policy | `GroupAdapter` | Require @mention in groups, restrict tools |
 | No directory | `DirectoryAdapter` | List contacts/groups for outbound targeting |
+
+---
+
+## Walkthrough: How It All Fits Together
+
+### The Big Picture
+
+The gateway is the **bridge between messaging channels** (web chat, Telegram, Discord, email, etc.) and **the AI agent**. In a multi-tenant SaaS context, it handles the fact that 50 different organizations might each have their own Telegram bot, their own Discord server, their own web widget — all running through the same gateway process.
+
+### Why Each Principle Matters
+
+**Stateless Plugins, External State** — A plugin (e.g., the Telegram plugin) has zero instance variables. It's just a bag of functions. All mutable state (is this account running? when did it last connect? what's the error?) lives in the `ChannelManager`. The plugin gets `get_status()` and `set_status()` callbacks passed to it. If the plugin crashes, the state survives. You can restart an account without losing bookkeeping.
+
+**Composable Optional Adapters** — Instead of a base class with 20 abstract methods you must override, the plugin is a struct with ~20 optional slots. The Telegram plugin implements `gateway`, `outbound`, `security`, `mentions`, `commands`. The web plugin implements just `config` and `outbound`. The infrastructure checks `if plugin.security:` before calling it. No dead code — a channel that doesn't have groups doesn't need to implement `resolve_require_mention()` returning `None`.
+
+**Two-Tier Weight (Descriptor vs Plugin)** — `ChannelDescriptor` is lightweight metadata (name, capabilities, chunk limits) that's always loaded. `ChannelPlugin` is the heavy implementation with platform SDK imports. Routing logic, allowlist checks, and UI rendering only need descriptors. You don't want to import the Telegram SDK just to check if a channel supports threads.
+
+**Per-Account Lifecycle** — One plugin definition, many accounts. If 3 tenants each have a Telegram bot, the `ChannelManager` runs `start_account()` three times on the same plugin, each with its own cancel signal, task, and snapshot.
+
+**Reply Dispatcher with Kind Discrimination** — Every outbound message is classified as `tool` (internal debugging), `block` (streaming text mid-generation), or `final` (complete reply). External channels like Telegram only receive finals. WebSocket clients get everything. Human-like delays (800-2500ms) are inserted between blocks.
+
+**Config-Driven Multi-Tenancy** — Plugins receive a `TenantConfig` scoped to an org. The plugin code never changes between tenants — isolation happens at the config boundary.
+
+**Capabilities Declaration** — Each channel declares what it supports (threads? reactions? media? inline streaming?). The agent receives this so it doesn't try to send polls on a channel that can't render them.
+
+### Core Data Flow
+
+Here's how a message flows through the system:
+
+```
+User sends message on Telegram
+        |
+        v
+   Webhook hits FastAPI endpoint
+        |
+        v
+   Returns 200 immediately (async transport)
+        |
+        v
+   MessagePipeline.process_inbound() runs in background task:
+        |
+        +-- Stage 1: normalize_raw()
+        |   Telegram Update -> NormalizedMessage (frozen/immutable)
+        |
+        +-- Stage 2: security check
+        |   Is this user allowed? (if plugin.security exists)
+        |
+        +-- Stage 3: strip mentions
+        |   Remove "@botname" from text (if plugin.mentions exists)
+        |
+        +-- Stage 4: command handling
+        |   "/start" short-circuits before agent (if plugin.commands exists)
+        |
+        +-- Stage 5: group policy
+        |   Require @mention in groups? (if plugin.groups exists)
+        |
+        +-- Stage 6: invoke agent
+            Yields tool/block/final events
+                |
+                v
+         ReplyDispatcher (serialized queue)
+                |
+                +-- normalize: strip silent tokens, heartbeat tokens, sanitize
+                +-- classify: tool -> drop, block -> delay, final -> deliver
+                +-- deliver via OutboundAdapter.send_text()
+                        |
+                        v
+                   BlockStreamingCoalescer
+                   (buffer 800-1200 chars, flush on paragraph breaks)
+                        |
+                        v
+                   TextChunker
+                   (split long messages for platform limits)
+                        |
+                        v
+                   Telegram Bot API sendMessage()
+```
+
+For **web chat**, the flow is different — it's **sync transport**:
+
+```
+User sends message via SSE/WebSocket
+        |
+        v
+   pipeline.process_inbound() returns AsyncIterator
+        |
+        v
+   FastAPI streams each (payload, kind) as SSE events directly
+   (no ReplyDispatcher needed — the client handles all event kinds)
+```
+
+### ChannelManager State Model
+
+Owns all runtime state. Three maps per channel type:
+
+| Map | Key | Value | Purpose |
+|---|---|---|---|
+| `cancel_events` | `(channel_type, account_id)` | `asyncio.Event` | Signal account to stop |
+| `tasks` | `(channel_type, account_id)` | `asyncio.Task` | Running coroutine |
+| `snapshots` | `(channel_type, account_id)` | `ChannelAccountSnapshot` | Runtime state |
+
+The lifecycle: `start_account()` checks enabled -> checks configured -> creates cancel event -> creates context with `get_status`/`set_status` callbacks -> calls `plugin.gateway.start_account(ctx)` in a task -> on error/cancel, updates snapshot.
+
+### Multi-Tenancy Isolation
+
+Plugins don't know about tenants. Tenant isolation happens at two boundaries:
+
+1. **Config boundary** — `ChannelAccountConfig` has an `org_id`. Each tenant's Telegram bot is a separate account record in the DB.
+2. **Session boundary** — `ChannelSession` maps `(channel_type, account_id, platform_user_id)` -> `session_id`, scoped to `org_id`.
+
+When Org A's Telegram bot receives a message, it resolves to Org A's config and Org A's session — the plugin code is identical.
+
+### Plugin Example: Minimal vs Full
+
+A full plugin (Telegram):
+
+```python
+class TelegramPlugin:
+    descriptor = TELEGRAM_DESCRIPTOR       # lightweight metadata
+    config = TelegramConfigAdapter()       # resolve accounts from DB config
+    outbound = TelegramOutboundAdapter()   # send_text, send_media via Bot API
+    gateway = TelegramGatewayAdapter()     # start_account (webhook setup), stop_account
+    security = TelegramSecurityAdapter()   # DM policy, allowlist
+    mentions = TelegramMentionAdapter()    # strip @botname
+    commands = TelegramCommandAdapter()    # /start, /help
+    groups = TelegramGroupAdapter()        # require @mention in groups
+    status = TelegramStatusAdapter()       # health probe via getWebhookInfo
+
+    # Not needed for Telegram:
+    threading = None
+    directory = None
+    actions = None
+    auth = None
+    # ... etc
+```
+
+A minimal plugin (web):
+
+```python
+class WebPlugin:
+    descriptor = WEB_DESCRIPTOR
+    config = WebConfigAdapter()
+    outbound = WebOutboundAdapter()        # no-op — SSE handles delivery
+    # everything else = None
+```
+
+### Completion Routing (Async Agents)
+
+When an agent finishes a long-running task (minutes later), the result needs to get back to the right channel. This uses **Redis Streams** (not pub/sub) with consumer groups:
+
+1. Agent completes -> writes to `gateway:execution_completed` stream with serialized `ChannelIdentity`
+2. Gateway consumer group reads it -> looks up the plugin -> calls `outbound.send_text()`
+3. Consumer ACKs the message -> at-least-once delivery even across gateway restarts
+
+### Full Outbound Pipeline (Post-Agent)
+
+```
+Agent event -> ReplyDispatcher.enqueue()
+                    |
+                    +-- normalize: strip [silent], [heartbeat] tokens, sanitize text
+                    +-- kind check: tool events -> dropped for external channels
+                    +-- human delay: 800-2500ms between block replies
+                    |
+                    v
+              BlockStreamingCoalescer
+                    |
+                    +-- buffer text until min_chars (800) reached
+                    +-- flush at paragraph break if available
+                    +-- hard flush at max_chars (1200)
+                    +-- idle flush after 1000ms of no new text
+                    |
+                    v
+              TextChunker
+                    |
+                    +-- split by platform limit (4096 for Telegram, 2000 for Discord)
+                    +-- prefer paragraph -> line -> word -> hard split
+                    |
+                    v
+              OutboundAdapter.send_text() -> Platform API
+```
+
+---
+
+## Multi-Tenant Channel App Models
+
+### The Two Models
+
+When building a multi-tenant SaaS with channel integrations, there are two fundamentally different approaches for how channel apps (Slack, Discord, Teams, etc.) relate to tenants.
+
+### Model 1: Each Tenant Creates Their Own App
+
+Each tenant:
+1. Goes to the platform developer portal (api.slack.com, Discord Developer Portal, etc.)
+2. Creates their own app with their own name, avatar, permissions
+3. Installs it in their workspace/server
+4. Copies the bot token into your platform's settings UI
+5. The gateway connects using those tokens
+
+```
+Org A -> created SlackApp-A -> installed in Workspace-A -> bot token -> gateway account "org-a"
+Org B -> created SlackApp-B -> installed in Workspace-B -> bot token -> gateway account "org-b"
+Org C -> created SlackApp-C -> installed in Workspace-C -> bot token -> gateway account "org-c"
+```
+
+Each "account" in the gateway is a **separate app** with its own tokens. If 3 orgs use Slack, that's 3 different Slack apps, 3 sets of tokens, 3 independent connections.
+
+**Pros:**
+- Simple implementation (no OAuth)
+- Each tenant fully controls their app (name, avatar, permissions)
+- No rate limit sharing between tenants
+
+**Cons:**
+- Onboarding friction — every tenant must create an app manually
+- No centralized control over app permissions or updates
+
+**This is what OpenClaw uses.** Each user creates their own Slack app and pastes tokens into config.
+
+### Model 2: One App, Many Workspace Installs (SaaS Model)
+
+This is how Claude Code's Slack app, Linear, Notion, and most SaaS products work:
+
+1. **You** create ONE app (e.g., "Digital Coworker") on the platform
+2. You set up OAuth with redirect URLs
+3. Each tenant clicks "Add to Slack" -> OAuth consent -> platform gives you a **per-workspace bot token**
+4. You store that token in your DB, keyed to the tenant's `org_id`
+
+```
+Your single Slack App "Digital Coworker"
+    |
+    +-- Org A clicks "Add to Slack" -> OAuth -> bot token for Workspace-A -> stored as account for org-a
+    +-- Org B clicks "Add to Slack" -> OAuth -> bot token for Workspace-B -> stored as account for org-b
+    +-- Org C clicks "Add to Slack" -> OAuth -> bot token for Workspace-C -> stored as account for org-c
+```
+
+**Same app identity, different bot tokens per workspace.** The app name, avatar, and permissions are identical across all installs.
+
+**Pros:**
+- Frictionless onboarding (one-click "Add to Slack")
+- Centralized permission management
+- Professional appearance (consistent branding)
+
+**Cons:**
+- Need OAuth implementation and token refresh logic
+- Shared rate limits (Slack rate limits are per-app, not per-workspace)
+- Platform review process for distribution
+
+### Why the Gateway Design Handles Both
+
+The gateway doesn't care which model you use. In both cases, the `ChannelAccountConfig` looks the same:
+
+```python
+# Model 1: tenant created their own app
+ChannelAccountConfig(
+    id="acc_123",
+    org_id="org-a",
+    channel_type="slack",
+    config={"mode": "socket"},
+    credentials={"bot_token": "xoxb-THEIR-TOKEN", "app_token": "xapp-THEIR-TOKEN"},
+)
+
+# Model 2: your app installed via OAuth
+ChannelAccountConfig(
+    id="acc_456",
+    org_id="org-b",
+    channel_type="slack",
+    config={"mode": "http"},  # webhooks, not socket mode
+    credentials={"bot_token": "xoxb-OAUTH-ISSUED-TOKEN"},
+)
+```
+
+The plugin's `start_account()` receives the token from the config and connects. It doesn't know or care how the token was obtained.
+
+### What Changes Between the Two Models
+
+| Concern | Model 1 (Self-hosted apps) | Model 2 (Shared app + OAuth) |
+|---|---|---|
+| How tokens arrive | User pastes in settings UI | OAuth callback stores in DB |
+| Onboarding flow | "Create app, copy tokens" | "Click Add to Slack" button |
+| Socket Mode vs HTTP | Socket Mode (needs app token) | HTTP webhooks (one endpoint for all) |
+| Webhook routing | N/A (socket) | Endpoint receives events for ALL workspaces; look up `team_id` -> `org_id` -> `account_config` |
+| App identity | Different name/avatar per tenant | Same name/avatar everywhere |
+| Token refresh | Manual (tokens don't expire) | Need OAuth token rotation |
+
+### Recommended Approach for Multi-Tenant SaaS
+
+Use **Model 2** (one app, OAuth installs). Add the following to the gateway:
+
+**1. AuthAdapter for OAuth flow:**
+
+```python
+class SlackAuthAdapter:
+    async def get_install_url(self, org_id: str) -> str:
+        """Generate Slack OAuth URL with state=org_id."""
+        ...
+
+    async def handle_oauth_callback(self, code: str, state: str) -> ChannelAccountConfig:
+        """Exchange code for bot token, store as new channel account."""
+        ...
+```
+
+**2. Shared webhook endpoint with tenant routing:**
+
+```python
+@router.post("/hooks/slack/events")
+async def slack_events(request: Request):
+    payload = await request.json()
+    team_id = payload.get("team_id")
+    # Look up which org owns this workspace
+    account = await account_repo.get_by_platform_id("slack", team_id)
+    # Route to pipeline with that account's config
+    await pipeline.process_inbound(payload, account)
+```
+
+**3. Everything else stays identical.** The `ChannelManager` starts one account per workspace install, each with its own token. The plugin, dispatcher, coalescer, chunker — all unchanged.
+
+### Per-Channel App Model Summary
+
+| Channel | Typical Model | Notes |
+|---|---|---|
+| Slack | Model 2 (OAuth) | One app, "Add to Slack" button, per-workspace tokens |
+| Discord | Model 2 (OAuth) | One bot application, OAuth to add to servers |
+| Microsoft Teams | Model 2 (OAuth) | One Azure AD app, installed per tenant |
+| Telegram | Model 1 (per-tenant) | Each org creates their own bot via BotFather |
+| WhatsApp Business | Model 2 (API) | One Business Solution Provider, per-org phone numbers |
+| Email | Neither | SMTP/IMAP credentials per org, no app model |
+| Web | Neither | Built-in, auth at HTTP layer per org |
