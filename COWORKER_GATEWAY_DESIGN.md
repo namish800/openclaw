@@ -1471,25 +1471,282 @@ async def _deliver_telegram(plugin, payload, kind, account_config):
 
 ---
 
-## Protocols (Gateway ↔ coworker_api Boundary)
+## Protocols (Gateway <-> coworker_api Boundary)
+
+### Architectural Decisions
+
+These decisions were made during design review and capture critical trade-offs:
+
+**Decision 1: Plugin struct with adapter slots (not simple interface)**
+
+We considered a simpler `Channel(Protocol)` with 3 required methods + optional overrides.
+Rejected because: adapter slots are more composable (swap out just security without touching
+the rest), and the infrastructure checks `if plugin.security:` pattern is already proven in
+OpenClaw. The verbosity of setting 15 slots to `None` is a one-time cost per channel.
+
+**Decision 2: Own AgentEvent type (not raw LangGraph events)**
+
+The AgentInvoker yields our own `AgentEvent` type, not raw LangGraph `astream_events` output.
+If a Telegram channel developer has to understand LangGraph's event format, the abstraction
+has leaked. `AgentEvent` is a clean boundary. The mapping from LangGraph to AgentEvent lives
+in one place (the invoker implementation). Channel developers only see AgentEvent.
+
+**Decision 3: Two-level AgentInvoker API**
+
+The web channel is fundamentally different from every other channel. It needs AG-UI protocol
+fidelity: state snapshots, messages snapshots, step transitions, tool calls with arguments,
+thinking, shared state edits, bidirectional commands (resume, state_sync). Trying to force
+AG-UI's complexity through a generic AgentEvent type either bloats the abstraction or loses
+fidelity.
+
+Solution: two methods on `AgentInvoker`:
+- `invoke()` — yields clean `AgentEvent` (for email, telegram, slack, etc.)
+- `invoke_raw()` — yields raw LangGraph stream + graph access (for web/AG-UI only)
+
+Simple channels use `invoke()`. Web uses `invoke_raw()` and does its own AG-UI translation.
+
+**Decision 4: ReplyDispatcher is optional (composable, not mandatory)**
+
+For email, there's no queue, no human delays, no coalescing. You collect the final reply and
+send one email. The dispatcher adds machinery that only pays off for streaming/real-time
+channels. Following the composable adapter philosophy, the dispatcher is an opt-in capability —
+like a StreamingAdapter that only streaming channels attach.
+
+- **Web**: No dispatcher. Sync transport streams `invoke_raw()` output directly as SSE.
+- **Email**: No dispatcher. Collects `TEXT_COMPLETE` events from `invoke()`, sends one email.
+- **Telegram/Slack**: Uses dispatcher. Filters by kind, applies human delays, coalesces blocks.
+
+### AgentEvent (Channel-Agnostic Event Type)
+
+```python
+class AgentEventType(str, Enum):
+    """Event types yielded by AgentInvoker.invoke().
+
+    This is the gateway's own event vocabulary. It does NOT mirror AG-UI or
+    LangGraph. The mapping from LangGraph events to AgentEvent lives inside
+    the invoker implementation. Channel developers never see LangGraph internals."""
+
+    RUN_STARTED = "run_started"         # Agent execution began
+    RUN_FINISHED = "run_finished"       # Agent execution completed
+    TEXT_DELTA = "text_delta"           # Incremental text (streaming)
+    TEXT_COMPLETE = "text_complete"     # Final complete text block
+    TOOL_START = "tool_start"          # Tool call initiated
+    TOOL_END = "tool_end"              # Tool call finished (with result)
+    THINKING = "thinking"              # Agent reasoning (if exposed)
+    ERROR = "error"                    # Error occurred
+    DONE = "done"                      # Stream exhausted
+
+
+@dataclass(frozen=True)
+class AgentEvent:
+    """Single event from agent execution. Immutable, channel-agnostic.
+
+    Channels consume these via EventKind classification:
+    - TOOL_START/TOOL_END -> EventKind.TOOL (internal channels only)
+    - TEXT_DELTA -> EventKind.BLOCK (streaming channels only)
+    - TEXT_COMPLETE -> EventKind.FINAL (all channels)
+    - RUN_STARTED/RUN_FINISHED/DONE -> lifecycle, not delivered to users
+    """
+    type: AgentEventType
+    content: str | None = None          # Text content (for deltas, complete, errors)
+    tool_name: str | None = None        # Tool name (for TOOL_START/TOOL_END)
+    tool_args: dict[str, Any] | None = None   # Tool arguments (TOOL_START)
+    tool_result: str | None = None      # Tool result (TOOL_END)
+    metadata: dict[str, Any] = field(default_factory=dict)
+```
+
+### AgentStream (Raw Access for Web/AG-UI)
+
+```python
+@dataclass
+class AgentStream:
+    """Raw agent execution stream for rich clients (web/AG-UI).
+
+    Only used by web channel. Provides direct access to LangGraph's
+    astream_events output and graph state. The web transport maps
+    these to AG-UI BaseEvent types (RunStarted, TextMessageContent,
+    ToolCallStart, StateSnapshot, MessagesSnapshot, etc.).
+
+    This exists because the web channel needs:
+    - State snapshots (agent's full state synced to UI)
+    - Messages snapshots (conversation history)
+    - Step transitions (which agent node is running)
+    - Tool calls with arguments AND results visible in UI
+    - Thinking/reasoning shown to user
+    - Shared state edits (user can edit state from UI)
+    - Run lifecycle (RunStarted, RunFinished, RunError)
+    - Bidirectional commands (resume, state_sync)
+
+    None of these are needed by email, telegram, slack, etc.
+    Forcing them through AgentEvent would bloat the abstraction."""
+
+    raw_events: AsyncIterator[dict]     # LangGraph astream_events output
+    graph: Any                          # CompiledGraph — for state access (aget_state)
+    thread_id: str                      # LangGraph thread ID
+    run_id: str                         # Current run ID
+```
+
+### AgentInvoker (Two-Level API)
 
 ```python
 class AgentInvoker(Protocol):
     """Abstracts agent invocation. Gateway defines, coworker_api implements.
 
-    Implementation wraps OrchestratorManager + AGUIStreamProcessor.
-    Yields raw BaseEvent objects (no SSE encoding — that's transport's job)."""
+    Two access levels:
+    - invoke(): Clean AgentEvent stream for standard channels (email, telegram, slack)
+    - invoke_raw(): Raw LangGraph stream for web/AG-UI (full protocol fidelity)
+
+    Implementation wraps OrchestratorManager + WorkflowOrchestrator.
+    The invoke() method internally runs the same LangGraph pipeline but
+    translates events into AgentEvent before yielding."""
 
     async def invoke(
         self,
         session_id: str,
         config: dict[str, Any],
         message: NormalizedMessage,
-    ) -> AsyncIterator[Any]:
-        """Invoke the agent and stream events."""
+    ) -> AsyncIterator[AgentEvent]:
+        """Simple API: yields clean AgentEvents.
+
+        Used by: email, telegram, slack, discord, signal, whatsapp, etc.
+
+        The implementation:
+        1. Resolves agent config from session_id
+        2. Builds LangGraph input from NormalizedMessage
+        3. Runs OrchestratorManager.astream_events()
+        4. Maps LangGraph events -> AgentEvent
+        5. Yields AgentEvent
+
+        Channel developers only see AgentEvent. They never touch LangGraph."""
         ...
 
+    async def invoke_raw(
+        self,
+        session_id: str,
+        config: dict[str, Any],
+        message: NormalizedMessage,
+        *,
+        forwarded_props: dict[str, Any] | None = None,
+    ) -> AgentStream:
+        """Rich API: returns raw LangGraph stream + graph access.
 
+        Used by: web channel ONLY (AG-UI protocol).
+
+        The web transport takes the AgentStream and runs the existing
+        AGUIStreamProcessor logic to map LangGraph events -> AG-UI BaseEvents
+        -> SSE. This preserves full AG-UI fidelity: state snapshots, messages
+        snapshots, step transitions, shared state edits, resume commands.
+
+        forwarded_props: AG-UI forwarded props from the client (state edits,
+        resume commands, etc.). These are passed through to LangGraph as
+        Command objects."""
+        ...
+```
+
+### How Channels Consume Agent Output
+
+```python
+# ── Email: collect finals, send one email ────────────────────
+async def process_email(message: NormalizedMessage, account_config: ChannelAccountConfig):
+    text_parts: list[str] = []
+
+    async for event in agent_invoker.invoke(session_id, config, message):
+        if event.type == AgentEventType.TEXT_COMPLETE:
+            text_parts.append(event.content)
+        elif event.type == AgentEventType.ERROR:
+            text_parts.append(f"Error: {event.content}")
+
+    # One email with the complete response
+    if text_parts:
+        final_text = "\n\n".join(text_parts)
+        await email_outbound.send_text(
+            to=message.sender.platform_user_id,
+            text=final_text,
+            reply_to_id=message.id,
+            thread_id=message.thread_id,
+        )
+
+
+# ── Telegram: use dispatcher for kind filtering + delays ─────
+async def process_telegram(message: NormalizedMessage, account_config: ChannelAccountConfig):
+    dispatcher = ReplyDispatcher(
+        deliver=lambda payload, kind: _deliver_telegram(plugin, payload, kind, account_config),
+        human_delay_min_ms=800,
+        human_delay_max_ms=2500,
+    )
+
+    async for event in agent_invoker.invoke(session_id, config, message):
+        kind = classify_event(event)
+        payload = event_to_payload(event)
+        if payload:
+            if kind == EventKind.TOOL:
+                dispatcher.send_tool_result(payload)
+            elif kind == EventKind.BLOCK:
+                dispatcher.send_block_reply(payload)
+            else:
+                dispatcher.send_final_reply(payload)
+
+    await dispatcher.wait_for_idle()
+    await dispatcher.close()
+
+
+# ── Web: raw stream -> AG-UI SSE (full protocol) ─────────────
+async def web_sse_endpoint(request: Request, message: NormalizedMessage):
+    stream = await agent_invoker.invoke_raw(
+        session_id, config, message,
+        forwarded_props=raw_input.forwarded_props,
+    )
+
+    async def generate():
+        # Existing AGUIStreamProcessor logic maps LangGraph -> AG-UI -> SSE
+        processor = AGUIStreamProcessor(graph=stream.graph, thread_id=stream.thread_id)
+        async for agui_event in processor.process(stream.raw_events):
+            yield encode_sse(agui_event)
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+def classify_event(event: AgentEvent) -> EventKind:
+    """Map AgentEvent to EventKind for dispatcher."""
+    if event.type in (AgentEventType.TOOL_START, AgentEventType.TOOL_END):
+        return EventKind.TOOL
+    if event.type == AgentEventType.TEXT_DELTA:
+        return EventKind.BLOCK
+    return EventKind.FINAL
+
+
+def event_to_payload(event: AgentEvent) -> ReplyPayload | None:
+    """Convert AgentEvent to ReplyPayload for delivery."""
+    if event.content:
+        return ReplyPayload(text=event.content)
+    if event.type == AgentEventType.TOOL_END and event.tool_result:
+        return ReplyPayload(text=f"[{event.tool_name}]: {event.tool_result}")
+    return None
+```
+
+### Why Web Is Special
+
+The web channel via AG-UI is not "send text, receive text." It's a rich bidirectional protocol:
+
+| Feature | Web (AG-UI) | Email/Telegram/Slack |
+|---|---|---|
+| State snapshots | Agent's full state synced to UI | Not applicable |
+| Messages snapshots | Conversation history synced | Not applicable |
+| Step transitions | User sees which agent node runs | Not applicable |
+| Tool calls | Visible with args and results | At most a text summary |
+| Thinking | Reasoning shown to user | Not applicable |
+| Shared state edits | User edits state from UI | Not applicable |
+| Run lifecycle | RunStarted/Finished/Error | Not applicable |
+| Bidirectional commands | resume, state_sync | Not applicable |
+| Transport | SSE with structured events | Single text message |
+
+This is why `invoke_raw()` exists. The web channel needs direct access to LangGraph's event
+stream and graph state to maintain AG-UI protocol fidelity. Every other channel just needs
+"what did the agent say?" — which is what `invoke()` provides.
+
+### Other Protocols
+
+```python
 class SessionResolver(Protocol):
     """Maps ChannelIdentity -> internal session_id. Creates if needed."""
 
@@ -3262,3 +3519,102 @@ class EmailLoopProtection:
         headers["X-Mailer"] = "Digital-Coworker-Gateway"
         return headers
 ```
+
+### Email Design Decisions
+
+These questions were raised during design review. The answers are recorded here as binding decisions.
+
+**Q1: Inbound mechanism — IMAP polling or webhooks?**
+
+**Decision: Support both, start with webhooks (SendGrid Inbound Parse / Mailgun Routes / SES).**
+
+Webhooks fit the existing architecture (FastAPI receiving POSTs, like Telegram/Slack/Discord).
+IMAP polling doesn't scale for multi-tenant — 200 orgs = 200 persistent IMAP connections with
+polling loops, reconnection logic, and IDLE support. Webhooks are instant (no 30s polling delay).
+
+Day-one setup:
+```
+SendGrid Inbound Parse -> POST /hooks/email/inbound -> EmailPlugin.normalize_raw() -> pipeline
+```
+
+One webhook endpoint handles all tenants. Tenant routing is by `to` address — each org configures
+which address their agent listens on (`support@acme.com`), and we look up the account by matching
+the recipient.
+
+IMAP will be added later for: enterprise customers who can't configure webhook forwarding,
+on-prem deployments, and Google Workspace / Microsoft 365 accounts.
+
+**Q2: Session/thread mapping — new thread = new session?**
+
+**Decision: Yes. New email thread = new session, replies in same thread = same session.**
+
+The `thread_id` is the root Message-ID (first entry in `References` header), not `In-Reply-To`
+(which is just the immediate parent). This handles branching:
+
+```
+Email A (Message-ID: <aaa>)
+  +-- Reply B (In-Reply-To: <aaa>, References: <aaa>)
+  |     +-- Reply D (In-Reply-To: <bbb>, References: <aaa> <bbb>)
+  +-- Reply C (In-Reply-To: <aaa>, References: <aaa>)
+```
+
+Both branches resolve to `thread_id = <aaa>` — same session.
+
+First email from a sender (no thread) and its subsequent thread replies share the same session.
+The thread_id -> session mapping is stored in ChannelSession for continuity.
+
+**Q3: What triggers agent invocation?**
+
+**Decision: Every inbound email to the configured address, filtered by security adapter.**
+
+Two-layer routing:
+1. **Recipient routing** — `to` address determines which `ChannelAccountConfig` handles it
+2. **Security adapter** — `EmailSecurityAdapter` checks sender against allowlist
+
+What should NOT trigger the agent:
+- Auto-replies (detected via `Auto-Submitted` header)
+- Bounce notifications (detected via `Precedence: bulk`)
+- Emails from the agent itself (detected via `X-Mailer` header or Message-ID domain)
+- Spam (provider spam scoring)
+
+**Q4: Should the agent read email attachments?**
+
+**Decision: Yes. Attachments are uploaded to tenant-scoped object storage and passed as ContentItems.**
+
+```python
+async def _process_attachments(self, raw: EmailMessage, org_id: str) -> list[ContentItem]:
+    items = []
+    for attachment in raw.attachments or []:
+        storage_url = await self._storage.upload(
+            bucket=f"org-{org_id}/email-attachments",
+            filename=attachment.filename,
+            content=attachment.content,
+            content_type=attachment.mime_type,
+        )
+        items.append(ContentItem(
+            type=self._classify(attachment.mime_type),
+            url=storage_url,
+            mime_type=attachment.mime_type,
+            metadata={"filename": attachment.filename, "size": attachment.size},
+        ))
+    return items
+```
+
+Limits: 25MB per attachment, 50MB per email total. Allow common business formats (PDF, DOCX,
+XLSX, CSV, images). Block executables. The agent accesses files via sandbox-mounted storage URLs.
+
+**Q5: Reply format — plain text or HTML?**
+
+**Decision: Both. Multipart/alternative with text/plain AND text/html.**
+
+The agent's markdown response is converted to HTML for the primary part, with a plain text
+fallback. Modern clients render HTML, older/plaintext clients get text.
+
+No quoted original text in replies — the email client shows thread history, and the agent
+already has conversation context via the session. Including quoted text bloats every reply.
+
+Outbound emails include:
+- `In-Reply-To` and `References` headers for thread continuity
+- `Auto-Submitted: auto-generated` to prevent reply loops
+- `multipart/alternative` with text/plain + text/html
+- A minimal footer: "Sent by Digital Coworker"
