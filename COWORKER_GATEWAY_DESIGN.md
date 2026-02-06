@@ -2245,3 +2245,224 @@ async def slack_events(request: Request):
 | WhatsApp Business | Model 2 (API) | One Business Solution Provider, per-org phone numbers |
 | Email | Neither | SMTP/IMAP credentials per org, no app model |
 | Web | Neither | Built-in, auth at HTTP layer per org |
+
+---
+
+## Session Keys and Routing
+
+### What a Session Key Is
+
+A session key is the string that determines **which conversation context** (memory, thread history, agent state) a message maps to. Two messages with the same session key share the same conversation. Two messages with different session keys are isolated conversations.
+
+In OpenClaw, session keys follow this format:
+
+```
+agent:<agentId>:<channel>:<peerKind>:<peerId>
+```
+
+For example:
+- `agent:main:telegram:dm:123456` — DM with Telegram user 123456, routed to agent "main"
+- `agent:main:slack:group:C0123ABCD` — Slack channel C0123ABCD, routed to agent "main"
+- `agent:support:discord:dm:987654321` — DM with Discord user, routed to agent "support"
+- `agent:main:main` — The default "main" session (web chat, no peer context)
+
+### DM Scope Modes
+
+The `dmScope` setting controls how DM conversations are isolated. This is critical for multi-tenant because different tenants may want different behavior:
+
+| Mode | Session Key | Behavior |
+|---|---|---|
+| `main` (default) | `agent:<agentId>:main` | All DMs share ONE conversation. User on Telegram and same user on Slack see the same history. |
+| `per-peer` | `agent:<agentId>:dm:<peerId>` | Each unique user gets their own conversation, but cross-channel messages from the same person merge. |
+| `per-channel-peer` | `agent:<agentId>:<channel>:dm:<peerId>` | Each user on each channel is isolated. Telegram user 123 and Slack user 123 are separate conversations. |
+| `per-account-channel-peer` | `agent:<agentId>:<channel>:<accountId>:dm:<peerId>` | Fully isolated. Same user talking to two different Telegram bots (two accounts) gets separate conversations. |
+
+For a multi-tenant SaaS, the recommended default is **`per-account-channel-peer`** — full isolation prevents any data leakage between tenants, accounts, or channels.
+
+### Identity Linking
+
+OpenClaw supports linking identities across channels so that the same person on different platforms can share a conversation (when dmScope allows it):
+
+```python
+# Config: identity_links maps a canonical name to platform-prefixed peer IDs
+identity_links = {
+    "alice": ["telegram:123456", "slack:U0ABC"],
+    "bob": ["discord:987654321", "whatsapp:+15551234567"],
+}
+```
+
+When `dmScope` is `per-peer` and Alice messages from Telegram (peer ID `telegram:123456`), the system looks up the canonical name "alice" and uses that as the peerId in the session key. When she messages from Slack, it resolves to the same canonical name — same session key, same conversation.
+
+For multi-tenant, identity links are stored **per org** in the DB:
+
+```python
+@dataclass
+class IdentityLink:
+    org_id: str
+    canonical_name: str               # "alice"
+    platform_ids: list[str]           # ["telegram:123456", "slack:U0ABC"]
+```
+
+### Binding Priority (Agent Routing)
+
+When a message arrives, the system needs to decide **which agent** handles it. OpenClaw uses a binding priority chain that matches from most specific to least specific:
+
+```
+1. binding.peer          — Exact peer match (e.g., "route user X to agent support")
+2. binding.peer.parent   — Thread parent match (thread inherits parent's binding)
+3. binding.guild         — Discord server / Slack workspace match
+4. binding.team          — Team-level match
+5. binding.account       — Channel account match (e.g., "all messages to this Telegram bot go to agent sales")
+6. binding.channel       — Channel type match with wildcard account (e.g., "all Telegram -> agent main")
+7. default               — Falls back to the default agent
+```
+
+For multi-tenant, bindings are stored per org:
+
+```python
+@dataclass(frozen=True)
+class AgentBinding:
+    """Routes messages to specific agents based on match criteria.
+
+    OpenClaw equivalent: routing bindings (src/routing/bindings.ts)."""
+    org_id: str
+    agent_id: str
+    match: BindingMatch
+
+@dataclass(frozen=True)
+class BindingMatch:
+    channel: str                      # Required: which channel
+    account_id: str | None = None     # Optional: specific account (None = default, "*" = any)
+    peer: RoutePeer | None = None     # Optional: specific peer
+    guild_id: str | None = None       # Optional: Discord server ID
+    team_id: str | None = None        # Optional: Slack workspace ID
+```
+
+### Thread Session Keys
+
+When a channel supports threads (Slack, Discord), the session key gets a thread suffix:
+
+```
+base:    agent:main:slack:group:C0123ABCD
+thread:  agent:main:slack:group:C0123ABCD:thread:1234567890.123456
+```
+
+The thread inherits the parent's agent binding but gets its own conversation history. This is handled by `resolveThreadSessionKeys()`:
+
+```python
+def resolve_thread_session_key(
+    base_session_key: str,
+    thread_id: str | None,
+) -> tuple[str, str | None]:
+    """Append thread suffix to session key if thread_id is present.
+
+    Returns (session_key, parent_session_key).
+
+    OpenClaw equivalent: resolveThreadSessionKeys (session-key.ts:233-249)."""
+    if not thread_id:
+        return (base_session_key, None)
+    thread_key = f"{base_session_key}:thread:{thread_id.lower()}"
+    return (thread_key, base_session_key)
+```
+
+### Group History Keys
+
+Groups and channels get their own history key format that includes the account:
+
+```
+<channel>:<accountId>:<peerKind>:<peerId>
+```
+
+Example: `slack:default:group:C0123ABCD`
+
+This ensures that group message history is scoped to the specific account and channel, which is important when the same group could theoretically be visible through multiple accounts.
+
+### How Session Resolution Works in the Pipeline
+
+The `SessionResolver` protocol bridges the gap between channel identities and internal session keys:
+
+```python
+class SessionResolver(Protocol):
+    async def resolve(self, identity: ChannelIdentity, org_id: str) -> str:
+        """Maps a channel identity to an internal session key.
+
+        Steps:
+        1. Load org's routing config (bindings, dmScope, identityLinks)
+        2. Determine peer kind (dm/group/channel) from identity
+        3. Check bindings in priority order to find the target agent
+        4. Build session key using agentId + channel + accountId + peer + dmScope
+        5. If thread_id present, append thread suffix
+        6. Upsert ChannelSession record in DB for continuity
+        7. Return the session key
+        """
+        ...
+```
+
+The concrete implementation in `coworker_api`:
+
+```python
+class DatabaseSessionResolver:
+    def __init__(self, session_repo: ChannelSessionRepository, config_repo: OrgConfigRepository):
+        self._session_repo = session_repo
+        self._config_repo = config_repo
+
+    async def resolve(self, identity: ChannelIdentity, org_id: str) -> str:
+        # 1. Load org routing config
+        org_config = await self._config_repo.get(org_id)
+        dm_scope = org_config.session.dm_scope or "per-account-channel-peer"
+        identity_links = org_config.session.identity_links or {}
+        bindings = org_config.routing.bindings or []
+
+        # 2. Determine peer
+        peer = RoutePeer(
+            kind="group" if identity.platform_chat_id else "dm",
+            id=identity.platform_chat_id or identity.platform_user_id,
+        )
+
+        # 3. Resolve agent route (binding priority chain)
+        route = resolve_agent_route(
+            bindings=bindings,
+            channel=identity.channel_type,
+            account_id=identity.account_id,
+            peer=peer,
+        )
+
+        # 4. Build session key
+        session_key = build_session_key(
+            agent_id=route.agent_id,
+            channel=identity.channel_type,
+            account_id=identity.account_id,
+            peer=peer,
+            dm_scope=dm_scope,
+            identity_links=identity_links,
+        )
+
+        # 5. Thread suffix
+        thread_id = identity.metadata.get("thread_id")
+        if thread_id:
+            session_key = f"{session_key}:thread:{thread_id.lower()}"
+
+        # 6. Upsert channel session for continuity
+        await self._session_repo.upsert(
+            channel_type=identity.channel_type,
+            account_id=identity.account_id,
+            platform_user_id=identity.platform_user_id,
+            platform_chat_id=identity.platform_chat_id,
+            session_key=session_key,
+            org_id=org_id,
+        )
+
+        return session_key
+```
+
+### Multi-Tenant Session Key Scoping
+
+In OpenClaw (single-tenant), session keys don't include org_id because there's only one tenant. In multi-tenant, tenant isolation is enforced at two levels:
+
+1. **Account-level isolation** — Each `ChannelAccountConfig` belongs to an `org_id`. Different orgs have different accounts, so their session keys naturally differ (the `accountId` segment is different).
+
+2. **DB-level isolation** — The `ChannelSession` table includes `org_id`, so even if two session keys happened to collide, the DB query is always scoped: `WHERE org_id = ?`.
+
+3. **Agent-level isolation** — Each org has its own agent definitions. The `agentId` in the session key comes from the org's routing config, not a global pool.
+
+This means you do NOT need to prefix session keys with `org_id` — the natural account scoping already provides isolation. But as a safety net, you can use `per-account-channel-peer` as the default dmScope, which includes the accountId in the key.
