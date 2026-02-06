@@ -332,10 +332,12 @@ class ChannelPlugin(Protocol):
     descriptor: ChannelDescriptor
 
     config: "ConfigAdapter"
-    outbound: "OutboundAdapter"
 
     # ── Optional Adapters ───────────────────────────────────────
+    # OpenClaw makes EVERYTHING except id/meta/capabilities/config optional.
+    # Infrastructure checks `if plugin.outbound:` before calling.
 
+    outbound: "OutboundAdapter | None"           # Platform delivery (most channels need this)
     gateway: "GatewayAdapter | None"            # Lifecycle (start/stop accounts)
     security: "SecurityAdapter | None"          # DM policy, allowlist
     pairing: "PairingAdapter | None"            # Allowlist management UI
@@ -350,6 +352,11 @@ class ChannelPlugin(Protocol):
     auth: "AuthAdapter | None"                  # Login flows (QR, OAuth)
     onboarding: "OnboardingAdapter | None"      # Setup wizard hooks
     agent_prompt: "AgentPromptAdapter | None"   # Hints for the AI agent
+    elevated: "ElevatedAdapter | None"          # Elevated/admin operations
+    setup: "SetupAdapter | None"               # Post-config setup tasks
+    heartbeat: "HeartbeatAdapter | None"        # Keep-alive/heartbeat handling
+    resolver: "ResolverAdapter | None"          # Resolve targets/identifiers
+    streaming: "StreamingAdapter | None"        # Block streaming support
 ```
 
 ### Adapter Protocols
@@ -378,6 +385,15 @@ class ConfigAdapter(Protocol):
     def describe_account(
         self, account: Any
     ) -> ChannelAccountSnapshot: ...
+
+    async def normalize_raw(
+        self, raw_message: Any, account_config: ChannelAccountConfig
+    ) -> "NormalizedMessage":
+        """Channel-specific normalization of raw platform input into NormalizedMessage.
+        Each channel implements this to convert its native format (Telegram Update,
+        Discord Message, etc.) into the shared NormalizedMessage type.
+        org_id and session_id may be left empty — the pipeline fills them."""
+        ...
 
 
 # ── Gateway Adapter (lifecycle) ────────────────────────────────
@@ -969,11 +985,64 @@ class ReplyDispatcher:
         return True
 
     def _normalize(self, payload: ReplyPayload) -> ReplyPayload | None:
-        """Filter empty/silent payloads.
-        OpenClaw equivalent: normalizeReplyPayload (normalize-reply.ts:23-94)."""
-        if not payload.text and not payload.media_url and not payload.channel_data:
+        """Filter empty/silent/heartbeat payloads and sanitize text.
+
+        OpenClaw equivalent: normalizeReplyPayload (normalize-reply.ts:23-94).
+
+        Full normalization pipeline (matching OpenClaw):
+        1. Empty check — no text, no media, no channel_data → skip ("empty")
+        2. Silent token — text matches SILENT_REPLY_TOKEN → skip ("silent")
+        3. Heartbeat token — strip HEARTBEAT_TOKEN from text → skip if nothing remains ("heartbeat")
+        4. Sanitize — strip embedded PI/agent control sequences from user-facing text
+        5. Response prefix — prepend configured prefix (e.g., agent name)
+        """
+        has_media = bool(payload.media_url or payload.media_urls)
+        has_channel_data = bool(payload.channel_data)
+        text = (payload.text or "").strip()
+
+        # 1. Empty check
+        if not text and not has_media and not has_channel_data:
             return None
-        return payload
+
+        # 2. Silent token check
+        if text and self._is_silent(text):
+            if not has_media and not has_channel_data:
+                return None
+            text = ""
+
+        # 3. Heartbeat token strip
+        if text and self._HEARTBEAT_TOKEN in text:
+            text = text.replace(self._HEARTBEAT_TOKEN, "").strip()
+            if not text and not has_media and not has_channel_data:
+                return None
+
+        # 4. Sanitize user-facing text
+        if text:
+            text = self._sanitize(text)
+
+        if not text and not has_media and not has_channel_data:
+            return None
+
+        return ReplyPayload(
+            text=text or None,
+            media_url=payload.media_url,
+            media_urls=payload.media_urls,
+            reply_to_id=payload.reply_to_id,
+            audio_as_voice=payload.audio_as_voice,
+            is_error=payload.is_error,
+            channel_data=payload.channel_data,
+        )
+
+    _SILENT_TOKEN = "[silent]"
+    _HEARTBEAT_TOKEN = "[heartbeat]"
+
+    def _is_silent(self, text: str) -> bool:
+        return text.strip().lower() == self._SILENT_TOKEN
+
+    def _sanitize(self, text: str) -> str:
+        """Strip embedded control sequences not meant for end users."""
+        # Implementation: remove agent-internal markers, control chars, etc.
+        return text
 
     async def wait_for_idle(self) -> None:
         await self._queue.join()
@@ -984,6 +1053,183 @@ class ReplyDispatcher:
     async def close(self) -> None:
         self._queue.put_nowait(None)
         await self._task
+```
+
+---
+
+## Block Streaming Coalescer
+
+```python
+class BlockStreamingCoalescer:
+    """Buffers block replies and flushes when thresholds are met.
+
+    OpenClaw equivalent: block-streaming.ts (src/auto-reply/reply/block-streaming.ts).
+
+    Sits between the agent event stream and the ReplyDispatcher for block events.
+    Accumulates text until one of these conditions triggers a flush:
+    - Text exceeds min_chars AND a natural break point is found (paragraph/sentence)
+    - Text exceeds max_chars (hard limit — flush regardless)
+    - idle_ms elapses since last text arrived (idle timeout)
+
+    Defaults (from OpenClaw):
+    - min_chars: 800
+    - max_chars: 1200
+    - idle_ms: 1000
+    - break_preference: "paragraph" (also supports "newline", "sentence")
+    """
+
+    DEFAULT_MIN_CHARS = 800
+    DEFAULT_MAX_CHARS = 1200
+    DEFAULT_IDLE_MS = 1000
+
+    def __init__(
+        self,
+        on_flush: Callable[[str], Awaitable[None]],
+        min_chars: int = DEFAULT_MIN_CHARS,
+        max_chars: int = DEFAULT_MAX_CHARS,
+        idle_ms: int = DEFAULT_IDLE_MS,
+        break_preference: str = "paragraph",
+    ):
+        self._on_flush = on_flush
+        self._min_chars = min_chars
+        self._max_chars = max_chars
+        self._idle_ms = idle_ms
+        self._break_preference = break_preference
+        self._buffer = ""
+        self._idle_timer: asyncio.TimerHandle | None = None
+
+    async def append(self, text: str) -> None:
+        """Append text to the buffer and flush if thresholds are met."""
+        self._cancel_idle_timer()
+        self._buffer += text
+
+        # Hard limit: flush immediately
+        if len(self._buffer) >= self._max_chars:
+            await self._flush_at_break(self._max_chars)
+            return
+
+        # Soft limit: flush at natural break if we have enough text
+        if len(self._buffer) >= self._min_chars:
+            break_pos = self._find_break(self._buffer, self._min_chars)
+            if break_pos is not None:
+                await self._flush_up_to(break_pos)
+                return
+
+        # Start idle timer
+        self._start_idle_timer()
+
+    async def flush_remaining(self) -> None:
+        """Flush any remaining buffered text (called at end of stream)."""
+        self._cancel_idle_timer()
+        if self._buffer:
+            text = self._buffer
+            self._buffer = ""
+            await self._on_flush(text)
+
+    async def _flush_at_break(self, max_pos: int) -> None:
+        break_pos = self._find_break(self._buffer, max_pos) or max_pos
+        await self._flush_up_to(break_pos)
+
+    async def _flush_up_to(self, pos: int) -> None:
+        text = self._buffer[:pos]
+        self._buffer = self._buffer[pos:]
+        if text.strip():
+            await self._on_flush(text)
+
+    def _find_break(self, text: str, within: int) -> int | None:
+        """Find a natural break point within the first `within` chars."""
+        chunk = text[:within]
+        if self._break_preference == "paragraph":
+            idx = chunk.rfind("\n\n")
+            if idx >= 0:
+                return idx + 2
+        if self._break_preference in ("paragraph", "newline"):
+            idx = chunk.rfind("\n")
+            if idx >= 0:
+                return idx + 1
+        if self._break_preference == "sentence":
+            for sep in (". ", "! ", "? "):
+                idx = chunk.rfind(sep)
+                if idx >= 0:
+                    return idx + len(sep)
+        return None
+
+    def _start_idle_timer(self) -> None:
+        loop = asyncio.get_event_loop()
+        self._idle_timer = loop.call_later(
+            self._idle_ms / 1000, lambda: asyncio.ensure_future(self.flush_remaining())
+        )
+
+    def _cancel_idle_timer(self) -> None:
+        if self._idle_timer:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+```
+
+### Outbound Text Chunking
+
+```python
+class TextChunker:
+    """Splits long outbound text into platform-safe chunks.
+
+    OpenClaw equivalent: chunk.ts (src/auto-reply/chunk.ts).
+
+    Applied AFTER coalescing, BEFORE platform delivery. Each channel's
+    text_chunk_limit (from ChannelDescriptor) determines the max size.
+
+    Modes:
+    - "length": split at max length, preferring line/word boundaries
+    - "markdown": markdown-aware splitting (preserve code blocks, lists, headers)
+    - "newline": split on paragraph boundaries (double newline)
+    """
+
+    @staticmethod
+    def chunk(text: str, limit: int, mode: str = "length") -> list[str]:
+        if len(text) <= limit:
+            return [text]
+        if mode == "newline":
+            return TextChunker._chunk_by_paragraphs(text, limit)
+        if mode == "markdown":
+            return TextChunker._chunk_markdown_aware(text, limit)
+        return TextChunker._chunk_by_length(text, limit)
+
+    @staticmethod
+    def _chunk_by_length(text: str, limit: int) -> list[str]:
+        chunks = []
+        while len(text) > limit:
+            # Prefer line boundary
+            idx = text.rfind("\n", 0, limit)
+            if idx < limit // 2:
+                # Prefer word boundary
+                idx = text.rfind(" ", 0, limit)
+            if idx < limit // 4:
+                idx = limit  # Hard split
+            chunks.append(text[:idx].rstrip())
+            text = text[idx:].lstrip()
+        if text.strip():
+            chunks.append(text)
+        return chunks
+
+    @staticmethod
+    def _chunk_by_paragraphs(text: str, limit: int) -> list[str]:
+        paragraphs = text.split("\n\n")
+        chunks, current = [], ""
+        for para in paragraphs:
+            candidate = (current + "\n\n" + para).strip() if current else para
+            if len(candidate) > limit and current:
+                chunks.append(current)
+                current = para
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks
+
+    @staticmethod
+    def _chunk_markdown_aware(text: str, limit: int) -> list[str]:
+        """Split while preserving markdown code blocks and structure."""
+        # Implementation: track code fence state, prefer splitting outside fences
+        return TextChunker._chunk_by_length(text, limit)  # Fallback for now
 ```
 
 ---
