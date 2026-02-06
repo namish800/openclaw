@@ -2466,3 +2466,799 @@ In OpenClaw (single-tenant), session keys don't include org_id because there's o
 3. **Agent-level isolation** — Each org has its own agent definitions. The `agentId` in the session key comes from the org's routing config, not a global pool.
 
 This means you do NOT need to prefix session keys with `org_id` — the natural account scoping already provides isolation. But as a safety net, you can use `per-account-channel-peer` as the default dmScope, which includes the accountId in the key.
+
+---
+
+## Per-Channel Identity Extraction
+
+Each channel has different raw message formats. The plugin's `normalize_raw()` is responsible for extracting thread IDs, peer IDs, peer kind, and sender info from the platform-specific payload. This section documents what each channel provides and how it maps to `NormalizedMessage` fields.
+
+### Extraction Patterns Summary
+
+| Channel | Thread ID Source | Peer ID (DM) | Peer ID (Group) | Peer Kind Marker | Has Threads |
+|---|---|---|---|---|---|
+| **Web** | `thread_id` from client request | User ID from JWT | N/A (no groups) | Always `dm` | Yes (client-managed) |
+| **Email** | `In-Reply-To` / `References` headers | Sender email address | N/A | Always `dm` | Yes (email threads) |
+| **Telegram** | `message_thread_id` (forums only) | `chat.id` | `chat.id` + optional topic ID | `chat.type` field | Forums only |
+| **Slack** | `message.thread_ts` | `message.user` | `message.channel` | Channel ID prefix (D/C/G) | Yes |
+| **Discord** | `message.channelId` (threads are channels) | `author.id` | `message.channelId` | `ChannelType` enum | Yes |
+| **Signal** | None | Phone E.164 or UUID | `groupInfo.groupId` | Presence of `groupInfo` | No |
+| **WhatsApp** | None | E.164 phone number | Group JID (`@g.us`) | `chatType` field | No |
+| **MS Teams** | `replyToId` in thread | `from.aadObjectId` | `conversation.id` | `conversation.conversationType` | Yes |
+
+### Web Channel Extraction
+
+Web is the simplest — the client controls the context:
+
+```python
+class WebConfigAdapter:
+    async def normalize_raw(self, raw: RunAgentInput, account_config: ChannelAccountConfig) -> NormalizedMessage:
+        user_id = raw.metadata.get("user_id", "anonymous")  # From JWT
+        return NormalizedMessage(
+            id=raw.run_id or str(uuid.uuid4()),
+            sender=ChannelIdentity(
+                channel_type="web",
+                account_id=account_config.id,
+                platform_user_id=user_id,
+                platform_chat_id=None,          # Web is always DM
+                display_name=raw.metadata.get("display_name"),
+                metadata=raw.metadata or {},
+            ),
+            chat_type=ChatType.DIRECT,          # Web only supports DMs
+            body=raw.messages[-1].content,
+            thread_id=raw.thread_id,            # Client passes thread_id for conversation continuity
+            # ... other fields
+        )
+```
+
+**Session key examples:**
+- New conversation: `agent:main:web:default:dm:user_123`
+- Continued thread: `agent:main:web:default:dm:user_123:thread:abc-def-ghi`
+
+### Email Channel Extraction
+
+Email has a natural threading model via RFC 2822 headers. This is the most important part for your first channel implementation:
+
+```python
+class EmailConfigAdapter:
+    async def normalize_raw(self, raw: EmailMessage, account_config: ChannelAccountConfig) -> NormalizedMessage:
+        # 1. Extract sender
+        sender_email = raw.from_address                  # "alice@example.com"
+        sender_name = raw.from_name                      # "Alice Smith"
+
+        # 2. Extract thread ID from email headers
+        #    RFC 2822: In-Reply-To and References headers form the thread chain
+        #    The root Message-ID of the thread is the thread identifier
+        thread_id = self._resolve_thread_id(raw)
+
+        # 3. Determine if this is a new conversation or a reply
+        is_reply = bool(raw.in_reply_to or raw.references)
+
+        # 4. Extract content — email bodies can be text/plain, text/html, or multipart
+        body = self._extract_body(raw)
+        body_for_agent = self._strip_quoted_reply(body)  # Remove "On ... wrote:" quoted text
+
+        return NormalizedMessage(
+            id=raw.message_id,                           # RFC 2822 Message-ID
+            sender=ChannelIdentity(
+                channel_type="email",
+                account_id=account_config.id,
+                platform_user_id=sender_email,           # Email address is the user ID
+                platform_chat_id=None,                   # Email is always 1:1 (DM)
+                display_name=sender_name,
+                metadata={
+                    "subject": raw.subject,
+                    "message_id": raw.message_id,
+                    "in_reply_to": raw.in_reply_to,
+                    "references": raw.references,
+                    "cc": raw.cc,
+                },
+            ),
+            chat_type=ChatType.DIRECT,
+            direction="inbound",
+            body=body,
+            body_for_agent=body_for_agent,               # Stripped of quoted text
+            body_for_commands=body_for_agent,
+            content=self._extract_content_items(raw),    # Attachments as ContentItems
+            org_id="",                                   # Filled by pipeline
+            session_id="",                               # Filled by pipeline
+            thread_id=thread_id,                         # Root Message-ID of the thread
+            reply_to_id=raw.in_reply_to,                 # Direct parent message
+            thread_label=raw.subject,                    # Subject line as thread label
+            message_thread_id=raw.message_id,            # This message's ID in the thread
+            sender_name=sender_name,
+            sender_id=sender_email,
+            sender_username=sender_email,
+            timestamp=raw.date,
+            was_mentioned=True,                          # Email is always "addressed to us"
+            originating_channel="email",
+            originating_to=raw.to_address,
+            metadata={
+                "subject": raw.subject,
+                "cc": raw.cc,
+                "is_reply": is_reply,
+            },
+        )
+
+    def _resolve_thread_id(self, raw: EmailMessage) -> str | None:
+        """Find the root message of this email thread.
+
+        Email threading works via the References header, which lists all
+        Message-IDs in the chain from oldest to newest. The first entry
+        is the root (thread starter).
+
+        If no References header, check In-Reply-To. If neither exists,
+        this is a new conversation (no thread_id).
+        """
+        if raw.references:
+            # References is a list of Message-IDs, first = root
+            return raw.references[0]
+        if raw.in_reply_to:
+            # Single parent — treat it as the thread root
+            return raw.in_reply_to
+        return None  # New conversation
+
+    def _strip_quoted_reply(self, body: str) -> str:
+        """Strip 'On ... wrote:' quoted text from email replies.
+
+        The agent should only see the new content, not the entire
+        quoted thread history. Common patterns:
+        - 'On Mon, Jan 1, 2024 at 12:00 PM Alice <alice@...> wrote:'
+        - '> quoted line'
+        - '-----Original Message-----'
+        """
+        # Split on common quote markers
+        for marker in [
+            "\nOn ",           # Gmail/Apple Mail quote prefix
+            "\n>",             # Quoted text
+            "\n-----Original", # Outlook
+            "\n___",           # Separator lines
+        ]:
+            idx = body.find(marker)
+            if idx > 0:
+                return body[:idx].rstrip()
+        return body
+
+    def _extract_body(self, raw: EmailMessage) -> str:
+        """Extract the text body from a potentially multipart email."""
+        if raw.text_plain:
+            return raw.text_plain
+        if raw.text_html:
+            # Strip HTML tags for agent consumption
+            return self._html_to_text(raw.text_html)
+        return ""
+
+    def _extract_content_items(self, raw: EmailMessage) -> list[ContentItem]:
+        """Convert email attachments to ContentItems."""
+        items = []
+        if raw.text_plain or raw.text_html:
+            items.append(ContentItem(type=ContentType.TEXT, text=self._extract_body(raw)))
+        for attachment in raw.attachments or []:
+            content_type = self._classify_attachment(attachment.mime_type)
+            items.append(ContentItem(
+                type=content_type,
+                url=attachment.url,                      # S3/storage URL after upload
+                mime_type=attachment.mime_type,
+                metadata={"filename": attachment.filename, "size": attachment.size},
+            ))
+        return items
+
+    @staticmethod
+    def _classify_attachment(mime_type: str) -> ContentType:
+        if mime_type.startswith("image/"):
+            return ContentType.IMAGE
+        if mime_type.startswith("audio/"):
+            return ContentType.AUDIO
+        if mime_type.startswith("video/"):
+            return ContentType.VIDEO
+        return ContentType.FILE
+
+    @staticmethod
+    def _html_to_text(html: str) -> str:
+        """Basic HTML to text conversion."""
+        # Use a library like html2text or beautifulsoup in production
+        import re
+        text = re.sub(r"<br\s*/?>", "\n", html)
+        text = re.sub(r"<[^>]+>", "", text)
+        return text.strip()
+```
+
+### Email Raw Message Type
+
+```python
+@dataclass
+class EmailAttachment:
+    filename: str
+    mime_type: str
+    size: int
+    url: str                            # Storage URL after upload (S3, etc.)
+
+@dataclass
+class EmailMessage:
+    """Raw email as parsed by the inbound handler (IMAP fetch or webhook)."""
+    message_id: str                     # RFC 2822 Message-ID
+    from_address: str                   # sender@example.com
+    from_name: str | None               # "Alice Smith"
+    to_address: str                     # recipient@example.com (our inbox)
+    cc: list[str] | None
+    subject: str
+    date: datetime
+    text_plain: str | None              # text/plain body
+    text_html: str | None               # text/html body
+    in_reply_to: str | None             # Parent Message-ID
+    references: list[str] | None        # Thread chain of Message-IDs
+    attachments: list[EmailAttachment] | None
+```
+
+### Email Session Key Examples
+
+```
+# New email from alice@example.com to support@coworker.ai
+# No thread_id (new conversation)
+Session key: agent:main:email:acc_email_1:dm:alice@example.com
+
+# Alice replies to the same thread (References header has root Message-ID)
+# thread_id = "<original-message-id@example.com>"
+Session key: agent:main:email:acc_email_1:dm:alice@example.com:thread:<original-message-id@example.com>
+
+# Bob emails the same support inbox
+Session key: agent:main:email:acc_email_1:dm:bob@corp.com
+```
+
+### Telegram Extraction
+
+```python
+class TelegramConfigAdapter:
+    async def normalize_raw(self, raw: dict, account_config: ChannelAccountConfig) -> NormalizedMessage:
+        msg = raw.get("message") or raw.get("edited_message") or {}
+        chat = msg.get("chat", {})
+        sender = msg.get("from", {})
+
+        chat_id = chat.get("id")
+        chat_type_raw = chat.get("type")               # "private", "group", "supergroup", "channel"
+        is_group = chat_type_raw in ("group", "supergroup")
+        is_forum = chat.get("is_forum", False)
+
+        # Thread ID: only for forum topics (supergroup with is_forum=True)
+        message_thread_id = msg.get("message_thread_id")
+        thread_id = str(message_thread_id) if (is_forum and message_thread_id) else None
+
+        # Peer ID: for groups, include topic ID to scope conversations per topic
+        if is_group:
+            peer_id = f"group:{chat_id}" + (f":{message_thread_id}" if thread_id else "")
+        else:
+            peer_id = str(chat_id)
+
+        return NormalizedMessage(
+            sender=ChannelIdentity(
+                channel_type="telegram",
+                account_id=account_config.id,
+                platform_user_id=str(sender.get("id", "")),
+                platform_chat_id=str(chat_id) if is_group else None,
+                display_name=self._build_display_name(sender),
+                metadata={"is_forum": is_forum, "chat_type": chat_type_raw},
+            ),
+            chat_type=ChatType.GROUP if is_group else ChatType.DIRECT,
+            thread_id=thread_id,
+            message_thread_id=str(message_thread_id) if message_thread_id else None,
+            # ...
+        )
+```
+
+### Slack Extraction
+
+```python
+class SlackConfigAdapter:
+    async def normalize_raw(self, raw: dict, account_config: ChannelAccountConfig) -> NormalizedMessage:
+        event = raw.get("event", {})
+        channel_id = event.get("channel", "")
+        user_id = event.get("user", "")
+
+        # Thread ID: Slack uses thread_ts (timestamp of parent message)
+        thread_ts = event.get("thread_ts")              # Present only in threaded replies
+        is_thread_reply = bool(thread_ts and thread_ts != event.get("ts"))
+
+        # Peer kind from channel ID prefix
+        # D = DM, C = public channel, G = private channel/group DM
+        if channel_id.startswith("D"):
+            chat_type = ChatType.DIRECT
+            peer_id = user_id
+        elif channel_id.startswith("G"):
+            chat_type = ChatType.GROUP
+            peer_id = channel_id
+        else:
+            chat_type = ChatType.CHANNEL
+            peer_id = channel_id
+
+        return NormalizedMessage(
+            sender=ChannelIdentity(
+                channel_type="slack",
+                account_id=account_config.id,
+                platform_user_id=user_id,
+                platform_chat_id=channel_id if chat_type != ChatType.DIRECT else None,
+                display_name=event.get("user_profile", {}).get("display_name"),
+                metadata={"team_id": raw.get("team_id")},
+            ),
+            chat_type=chat_type,
+            thread_id=thread_ts,                         # Slack thread_ts = thread ID
+            message_thread_id=event.get("ts"),           # This message's ts
+            reply_to_id=thread_ts if is_thread_reply else None,
+            # ...
+        )
+```
+
+### Discord Extraction
+
+```python
+class DiscordConfigAdapter:
+    async def normalize_raw(self, raw: dict, account_config: ChannelAccountConfig) -> NormalizedMessage:
+        # Discord threads ARE channels — a thread's channel_id is the thread ID
+        channel_type = raw.get("channel", {}).get("type")
+        is_dm = channel_type == 1                       # ChannelType.DM
+        is_thread = channel_type in (11, 12)            # PUBLIC_THREAD, PRIVATE_THREAD
+
+        author = raw.get("author", {})
+        channel_id = raw.get("channel_id", "")
+
+        # Thread ID: the thread channel's ID
+        thread_id = channel_id if is_thread else None
+
+        # Peer ID
+        if is_dm:
+            peer_id = author.get("id", "")
+        else:
+            peer_id = channel_id
+
+        return NormalizedMessage(
+            sender=ChannelIdentity(
+                channel_type="discord",
+                account_id=account_config.id,
+                platform_user_id=author.get("id", ""),
+                platform_chat_id=channel_id if not is_dm else None,
+                display_name=author.get("username"),
+                metadata={
+                    "guild_id": raw.get("guild_id"),
+                    "is_thread": is_thread,
+                },
+            ),
+            chat_type=ChatType.DIRECT if is_dm else ChatType.CHANNEL,
+            thread_id=thread_id,
+            # ...
+        )
+```
+
+---
+
+## Email Channel — Full Plugin Design
+
+Email is one of the first channels to implement alongside web. It differs from chat channels in several important ways:
+
+### How Email Differs from Chat Channels
+
+| Aspect | Chat (Slack, Telegram) | Email |
+|---|---|---|
+| Transport | WebSocket / webhook (real-time) | IMAP polling or inbound webhook (delayed) |
+| Threading | Platform-managed (thread_ts, topic_id) | RFC 2822 headers (In-Reply-To, References) |
+| Message format | Plain text or markdown | Multipart MIME (text/plain + text/html + attachments) |
+| Reply delivery | Bot API sendMessage | SMTP send (or API like SendGrid/SES) |
+| Reply format | Text | Email with subject, headers, HTML formatting |
+| Quoted text | Not applicable | Must strip "On ... wrote:" before sending to agent |
+| Sender identity | Platform user ID | Email address (alice@example.com) |
+| Session continuity | Platform-managed (same chat = same context) | Header-based (same thread chain = same context) |
+| Agent should NOT see | N/A | Quoted reply text, email signatures, disclaimers |
+| Attachments | Platform-hosted URLs | MIME parts, need upload to storage |
+
+### Email Descriptor
+
+```python
+EMAIL_DESCRIPTOR = ChannelDescriptor(
+    id="email",
+    label="Email",
+    docs_path="/channels/email",
+    blurb="Inbound/outbound email via IMAP+SMTP or webhook providers (SendGrid, SES, etc.).",
+    capabilities=ChannelCapabilities(
+        chat_types=(ChatType.DIRECT,),
+        media=True,                     # Attachments
+        rich_formatting=True,           # HTML emails
+        block_streaming=False,          # Email is batch — no streaming
+        max_text_length=100_000,        # Emails can be long
+    ),
+    transport_mode=ChannelTransportMode.ASYNC,
+    text_chunk_limit=100_000,           # Don't chunk emails
+    debounce_ms=5000,                   # Debounce rapid-fire email (auto-replies, loops)
+)
+```
+
+### Email Plugin
+
+```python
+class EmailChannelPlugin:
+    descriptor = EMAIL_DESCRIPTOR
+
+    config = EmailConfigAdapter()
+    outbound = EmailOutboundAdapter()
+    gateway = EmailGatewayAdapter()     # IMAP polling or webhook listener
+    security = EmailSecurityAdapter()   # Spam filtering, allowlist by domain/address
+    commands = EmailCommandAdapter()    # Subject-line commands: "STOP", "UNSUBSCRIBE"
+
+    # Not applicable for email:
+    mentions = None                     # No @mentions in email
+    groups = None                       # No group email (could add CC handling later)
+    threading = None                    # Threading handled in normalize_raw via headers
+    streaming = None                    # Email is batch
+    messaging = None
+    directory = None
+    pairing = None
+    status = EmailStatusAdapter()       # Check IMAP connection, SMTP reachability
+    actions = None
+    auth = None                         # Credentials stored in account config
+    onboarding = None
+    agent_prompt = EmailAgentPromptAdapter()  # Tell agent it's replying to email
+    elevated = None
+    setup = None
+    heartbeat = None
+    resolver = None
+```
+
+### Email Gateway Adapter (Inbound)
+
+Two modes of receiving email:
+
+```python
+class EmailGatewayAdapter:
+    """Manages inbound email reception.
+
+    Mode 1: IMAP polling — connect to IMAP server, poll for new messages
+    Mode 2: Inbound webhook — receive POSTed emails from SendGrid/SES/Mailgun
+    """
+
+    async def start_account(self, ctx: ChannelGatewayContext) -> None:
+        mode = ctx.account_config.config.get("inbound_mode", "imap")
+
+        if mode == "imap":
+            await self._poll_imap(ctx)
+        elif mode == "webhook":
+            # Webhook mode: just register the webhook URL and wait
+            # The FastAPI route handles incoming POSTs
+            ctx.set_status(ChannelAccountSnapshot(
+                account_id=ctx.account_id, running=True, connected=True,
+            ))
+            # Block until cancelled
+            await self._wait_for_cancel(ctx.cancel_event)
+        else:
+            raise ValueError(f"Unknown inbound mode: {mode}")
+
+    async def _poll_imap(self, ctx: ChannelGatewayContext) -> None:
+        """Connect to IMAP and poll for new messages."""
+        creds = ctx.account_config.credentials
+        host = creds["imap_host"]
+        port = creds.get("imap_port", 993)
+        username = creds["imap_username"]
+        password = creds["imap_password"]
+        poll_interval = ctx.account_config.config.get("poll_interval_seconds", 30)
+
+        import aioimaplib
+        client = aioimaplib.IMAP4_SSL(host=host, port=port)
+        await client.wait_hello_from_server()
+        await client.login(username, password)
+        await client.select("INBOX")
+
+        ctx.set_status(ChannelAccountSnapshot(
+            account_id=ctx.account_id, running=True, connected=True,
+            last_connected_at=datetime.utcnow(),
+        ))
+
+        while not ctx.cancel_event.is_set():
+            try:
+                # Fetch unseen messages
+                _, data = await client.search("UNSEEN")
+                message_ids = data[0].split()
+
+                for msg_id in message_ids:
+                    _, msg_data = await client.fetch(msg_id, "(RFC822)")
+                    raw_email = self._parse_email(msg_data)
+
+                    # Process through pipeline (fire and forget)
+                    asyncio.create_task(
+                        self._process_email(raw_email, ctx.account_config)
+                    )
+
+                    # Mark as seen
+                    await client.store(msg_id, "+FLAGS", "\\Seen")
+
+            except Exception as e:
+                ctx.set_status(ChannelAccountSnapshot(
+                    account_id=ctx.account_id, running=True, connected=False,
+                    last_error=str(e),
+                ))
+
+            # Wait for next poll or cancellation
+            try:
+                await asyncio.wait_for(
+                    self._wait_for_cancel(ctx.cancel_event),
+                    timeout=poll_interval,
+                )
+                break  # cancel_event was set
+            except asyncio.TimeoutError:
+                pass  # Poll again
+
+        await client.logout()
+
+    async def stop_account(self, ctx: ChannelGatewayContext) -> None:
+        ctx.cancel_event.set()
+
+    async def _wait_for_cancel(self, event: asyncio.Event) -> None:
+        await event.wait()
+
+    def _parse_email(self, raw_data: bytes) -> EmailMessage:
+        """Parse raw RFC 822 email into EmailMessage dataclass."""
+        import email
+        from email import policy
+        msg = email.message_from_bytes(raw_data, policy=policy.default)
+        # ... extract fields into EmailMessage
+        ...
+```
+
+### Email Outbound Adapter
+
+```python
+class EmailOutboundAdapter:
+    """Sends reply emails via SMTP or API (SendGrid, SES, etc.)."""
+
+    delivery_mode = DeliveryMode.DIRECT
+    text_chunk_limit = 100_000          # Don't chunk emails
+    chunker_mode = "text"
+
+    async def send_text(
+        self, to: str, text: str, *,
+        account_id: str | None = None,
+        reply_to_id: str | None = None,
+        thread_id: str | None = None,
+    ) -> OutboundDeliveryResult:
+        """Send a reply email.
+
+        Key: set In-Reply-To and References headers to maintain the thread.
+        """
+        account_config = await self._load_account(account_id)
+        creds = account_config.credentials
+        mode = account_config.config.get("outbound_mode", "smtp")
+
+        # Build the email
+        subject = self._resolve_subject(account_config, reply_to_id)
+        html_body = self._text_to_html(text)
+
+        headers = {}
+        if reply_to_id:
+            headers["In-Reply-To"] = reply_to_id
+        if thread_id:
+            # References should include the full chain + the parent
+            headers["References"] = f"{thread_id} {reply_to_id}" if reply_to_id else thread_id
+
+        if mode == "smtp":
+            message_id = await self._send_smtp(
+                to=to,
+                subject=subject,
+                text_body=text,
+                html_body=html_body,
+                headers=headers,
+                creds=creds,
+            )
+        elif mode == "sendgrid":
+            message_id = await self._send_sendgrid(
+                to=to,
+                subject=subject,
+                text_body=text,
+                html_body=html_body,
+                headers=headers,
+                creds=creds,
+            )
+        else:
+            raise ValueError(f"Unknown outbound mode: {mode}")
+
+        return OutboundDeliveryResult(
+            channel="email",
+            message_id=message_id,
+            chat_id=to,
+        )
+
+    def _resolve_subject(self, account_config: ChannelAccountConfig, reply_to_id: str | None) -> str:
+        """If replying, prefix with Re: (if not already present)."""
+        # Look up original subject from stored message metadata
+        original_subject = self._get_original_subject(reply_to_id)
+        if original_subject:
+            if not original_subject.lower().startswith("re:"):
+                return f"Re: {original_subject}"
+            return original_subject
+        return account_config.config.get("default_subject", "Message from Digital Coworker")
+
+    def _text_to_html(self, text: str) -> str:
+        """Convert agent's markdown/text response to HTML email."""
+        import markdown
+        html = markdown.markdown(text, extensions=["extra", "codehilite"])
+        # Wrap in a basic email template
+        return f"""
+        <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    font-size: 14px; line-height: 1.6; color: #333;">
+            {html}
+        </div>
+        """
+
+    async def send_media(self, to, text, media_url, **kwargs):
+        """Send email with attachment."""
+        # Download media, attach as MIME part
+        ...
+
+    async def send_payload(self, to, payload, **kwargs):
+        if payload.text:
+            return await self.send_text(
+                to=to, text=payload.text,
+                reply_to_id=payload.reply_to_id,
+                **kwargs,
+            )
+```
+
+### Email Security Adapter
+
+```python
+class EmailSecurityAdapter:
+    """Spam protection and sender allowlisting for email."""
+
+    def resolve_dm_policy(self, account: Any, account_config: ChannelAccountConfig) -> DmPolicy | None:
+        policy_type = account_config.config.get("dm_policy", "allowlist")
+        allow_from = account_config.config.get("allow_from")
+
+        # Domain-based allowlisting: ["*@company.com", "alice@external.com"]
+        return DmPolicy(
+            policy=policy_type,
+            allow_from=allow_from,
+            approve_hint="Add sender email or *@domain.com to the allowlist",
+            normalize_entry=lambda e: e.strip().lower(),
+        )
+
+    async def collect_warnings(self, account: Any, account_config: ChannelAccountConfig) -> list[str]:
+        warnings = []
+        policy = account_config.config.get("dm_policy", "allowlist")
+        if policy == "everyone":
+            warnings.append("Email DM policy is 'everyone' — any sender can trigger the agent. Consider using 'allowlist' with domain restrictions.")
+        # Check for common misconfiguration
+        if not account_config.config.get("allow_from") and policy == "allowlist":
+            warnings.append("Allowlist is empty — no emails will be processed.")
+        return warnings
+```
+
+**Domain-matching for allowlist:**
+
+```python
+def _is_allowed(self, message: NormalizedMessage, policy: DmPolicy) -> bool:
+    if policy.policy == "everyone":
+        return True
+    if not policy.allow_from:
+        return False
+    sender = message.sender.platform_user_id.lower()  # email address
+    for entry in policy.allow_from:
+        entry = entry.strip().lower()
+        if entry.startswith("*@"):
+            # Domain wildcard: *@company.com matches anyone@company.com
+            domain = entry[1:]  # "@company.com"
+            if sender.endswith(domain):
+                return True
+        elif sender == entry:
+            return True
+    return False
+```
+
+### Email Agent Prompt Adapter
+
+```python
+class EmailAgentPromptAdapter:
+    def message_tool_hints(self, *, account_config: ChannelAccountConfig) -> list[str]:
+        return [
+            "You are replying to an email. Keep responses professional and well-formatted.",
+            "The user's message has been extracted from the email body — quoted reply text and signatures have been stripped.",
+            "Your response will be sent as an HTML email. You can use markdown formatting.",
+            "If the email had a subject line, maintain it in your response context.",
+            f"Reply-from address: {account_config.config.get('from_address', 'support@coworker.ai')}",
+        ]
+```
+
+### Email Command Adapter
+
+```python
+class EmailCommandAdapter:
+    enforce_owner_for_commands = False
+
+    def recognize_command(self, message: NormalizedMessage) -> str | None:
+        """Check subject line for commands."""
+        subject = message.metadata.get("subject", "").strip().upper()
+        if subject in ("STOP", "UNSUBSCRIBE"):
+            return "stop"
+        if subject == "STATUS":
+            return "status"
+        return None
+
+    async def handle_command(self, command: str, message: NormalizedMessage, *, account_config: ChannelAccountConfig) -> ReplyPayload | None:
+        if command == "stop":
+            return ReplyPayload(text="You have been unsubscribed. Reply START to re-enable.")
+        if command == "status":
+            return ReplyPayload(text="Digital Coworker is active. Reply with any message to get assistance.")
+        return None
+```
+
+### Email Account Configuration
+
+```python
+# Example ChannelAccountConfig for email
+ChannelAccountConfig(
+    id="acc_email_support",
+    org_id="org-acme",
+    channel_type="email",
+    name="Support Inbox",
+    enabled=True,
+    config={
+        "inbound_mode": "imap",             # "imap" | "webhook"
+        "outbound_mode": "smtp",            # "smtp" | "sendgrid" | "ses"
+        "from_address": "support@acme.com",
+        "from_name": "Acme Support",
+        "poll_interval_seconds": 30,
+        "dm_policy": "allowlist",
+        "allow_from": ["*@acme.com", "*@partner.com", "vip@external.com"],
+        "default_subject": "Message from Acme Support",
+        "strip_signatures": True,
+        "max_attachment_size_mb": 25,
+    },
+    credentials={
+        "imap_host": "imap.gmail.com",
+        "imap_port": 993,
+        "imap_username": "support@acme.com",
+        "imap_password": "app-specific-password",
+        "smtp_host": "smtp.gmail.com",
+        "smtp_port": 587,
+        "smtp_username": "support@acme.com",
+        "smtp_password": "app-specific-password",
+    },
+)
+```
+
+### Email Anti-Loop Protection
+
+Email is uniquely susceptible to reply loops (bot replies to bot). Add these safeguards:
+
+```python
+class EmailLoopProtection:
+    """Prevent infinite email reply loops."""
+
+    # Standard auto-reply headers that indicate automated messages
+    AUTO_REPLY_HEADERS = [
+        "X-Auto-Response-Suppress",       # Microsoft
+        "Auto-Submitted",                  # RFC 3834 (value: "auto-replied" or "auto-generated")
+        "X-Autoreply",                     # Various
+        "Precedence",                      # Value: "bulk" or "auto_reply"
+    ]
+
+    @staticmethod
+    def should_skip(raw: EmailMessage) -> bool:
+        """Return True if this email should NOT be processed."""
+        headers = raw.metadata.get("headers", {})
+
+        # 1. Check auto-reply headers
+        if headers.get("Auto-Submitted") in ("auto-replied", "auto-generated"):
+            return True
+        if headers.get("Precedence") in ("bulk", "auto_reply", "list"):
+            return True
+
+        # 2. Check for our own Message-ID domain (we sent this)
+        if raw.message_id and "coworker.ai" in raw.message_id:
+            return True
+
+        # 3. Rate limit: same sender, same thread, within N seconds
+        # (implemented via Redis with TTL key)
+        return False
+
+    @staticmethod
+    def add_outbound_headers(headers: dict) -> dict:
+        """Add headers to our outbound emails to prevent loops."""
+        headers["Auto-Submitted"] = "auto-generated"
+        headers["X-Auto-Response-Suppress"] = "All"
+        headers["X-Mailer"] = "Digital-Coworker-Gateway"
+        return headers
+```
