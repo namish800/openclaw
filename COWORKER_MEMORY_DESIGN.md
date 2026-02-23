@@ -27,7 +27,7 @@ connective tissue.
 Executions generate experience
   → Activity feed captures what happened (automatic)
   → Heartbeat reads feed, reflects, spots patterns
-  → Heartbeat writes memories (the insights)
+  → Heartbeat writes memories to files (the insights)
   → Future executions read memories, work smarter
 ```
 
@@ -46,11 +46,12 @@ The agent gets smarter over time without anyone telling it to.
                      pre-compaction flush
                            ↓
 ┌─────────────────────────────────────────────────────────────┐
-│  Layer 2: Agent Memory (long-term, agent-driven)            │
-│  = memories table + pgvector                                │
-│  Agent explicitly saves facts, preferences, observations.   │
-│  Pinned memories loaded into every session's system prompt.  │
-│  Unpinned memories reachable via memory_search.             │
+│  Layer 2: Agent Memory (long-term, file-driven)             │
+│  = memory files in sandbox + pgvector DB (synced)           │
+│  Agent writes to MEMORY.md and memory/*.md using `write`.   │
+│  Post-run sync persists to DB with embeddings.              │
+│  Pinned (MEMORY.md) loaded into every session prompt.       │
+│  Unpinned (memory/*.md) reachable via memory_search.        │
 └─────────────────────────────────────────────────────────────┘
                            ↑
                     memory_search()
@@ -76,12 +77,14 @@ When any long-running session nears its context limit, a silent agent turn
 fires before compaction:
 
 **System prompt:**
-> "Session nearing compaction. Save any durable facts using save_memory
-> before they are compressed."
+> "Session nearing compaction. Write any durable facts to your memory files
+> before they are compressed. Use `MEMORY.md` for critical facts and
+> `memory/YYYY-MM-DD.md` for daily observations."
 
-The agent calls `save_memory()` for important things, then compaction
-proceeds. Tracked via `memory_flush_compaction_count` on the session to ensure
-one flush per compaction cycle.
+The agent writes to memory files using the existing `write` tool, then
+compaction proceeds. A post-turn sync picks up the changes and upserts them
+to the DB. Tracked via `memory_flush_compaction_count` on the session to
+ensure one flush per compaction cycle.
 
 **Inspired by:** OpenClaw's `memory-flush.ts` — silent turn with
 `DEFAULT_MEMORY_FLUSH_PROMPT`, fires when `totalTokens` crosses
@@ -92,7 +95,55 @@ one flush per compaction cycle.
 ## Layer 2: Agent Memory
 
 The long-term store. Agent-driven — the agent explicitly decides what is worth
-remembering, just like OpenClaw's file-based approach.
+remembering by writing to files, exactly like OpenClaw.
+
+### Writing: Files, Not Tools
+
+The agent writes memories using the existing `write` tool. No special
+`save_memory`, `update_memory`, `pin_memory`, or `forget_memory` tools.
+Zero friction — the agent just writes to files in its sandbox.
+
+**Two files, two tiers:**
+
+| File | Tier | Loaded into prompt | Searchable |
+|---|---|---|---|
+| `MEMORY.md` | Pinned (curated) | Yes, every session | Yes |
+| `memory/YYYY-MM-DD.md` | Unpinned (daily log) | No | Yes |
+
+The agent writes to `MEMORY.md` for permanent, critical knowledge (like
+OpenClaw's curated `MEMORY.md`). It writes to `memory/YYYY-MM-DD.md` for
+daily observations, notes, and transient facts (like OpenClaw's daily logs).
+
+To "pin" a memory: write it to `MEMORY.md`.
+To "unpin" or "forget": remove it from `MEMORY.md`.
+To "update": edit the file.
+Promotion: move a line from `memory/*.md` into `MEMORY.md`.
+
+All of this uses the same `write`/`edit` tools the agent already has.
+
+### Post-Run Sync (files → DB)
+
+After every agent turn completes, a sync step reads the memory files from
+the sandbox, diffs against the DB, and upserts:
+
+```
+Post-run sync:
+1. Read MEMORY.md from sandbox
+2. Parse into individual entries (one per line/block)
+3. Diff against existing pinned=true rows in DB
+   - New lines → INSERT with pinned=true, generate embedding
+   - Removed lines → SET pinned=false (soft-unpin, entry stays searchable)
+   - Changed lines → UPDATE content + re-embed
+4. Read memory/*.md files from sandbox
+5. Diff against existing pinned=false rows for matching dates
+   - New content → INSERT with pinned=false, generate embedding
+   - Changed content → UPDATE + re-embed
+6. Batch embed all new/changed entries in one API call
+```
+
+This keeps the DB in sync as the source of truth for search, while the
+files remain the agent's writing surface. The agent never needs to know
+about the DB, embeddings, or vector search internals.
 
 ### Data Model
 
@@ -103,12 +154,10 @@ memories
 │ org_id             UUID FK organizations, NOT NULL            │
 │ agent_id           UUID FK agents, NOT NULL                   │
 │ content            TEXT NOT NULL                              │
-│ category           VARCHAR(50) NOT NULL DEFAULT 'general'     │
-│                      -- fact, preference, relationship,       │
-│                         observation, procedural, general      │
-│ related_entity     VARCHAR(255) nullable                      │
-│                      -- "user:alice", "process:onboarding",   │
-│                         "task:onboard-alice"                  │
+│ file_path          VARCHAR(255) NOT NULL                      │
+│                      -- "MEMORY.md" or "memory/2026-02-23.md" │
+│ line_hash          VARCHAR(64) NOT NULL                       │
+│                      -- SHA-256 of content, for diffing       │
 │ pinned             BOOLEAN NOT NULL DEFAULT FALSE             │
 │ source_session_id  UUID nullable                              │
 │ embedding          vector(1536)                               │
@@ -117,10 +166,15 @@ memories
 │                                                              │
 │ Indexes:                                                     │
 │   (agent_id, pinned) WHERE pinned = true    -- fast load     │
-│   (agent_id, category)                      -- filtered search│
+│   (agent_id, file_path)                     -- sync diffing  │
 │   HNSW on embedding                         -- vector search  │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+Note: No `category` or `related_entity` columns — they added friction to the
+writing experience. The agent can express structure naturally in the file
+content itself. Search is semantic (vector + keyword), so categories aren't
+needed for retrieval.
 
 ### Pinned vs Unpinned (inspired by MEMORY.md vs memory/*.md)
 
@@ -130,79 +184,58 @@ OpenClaw has two tiers of memory:
 - `memory/YYYY-MM-DD.md` — only reachable via `memory_search`. Running
   daily notes. Bulk of memory.
 
-The coworker mirrors this with a `pinned` boolean:
+The coworker mirrors this exactly:
 
-| | Pinned | Unpinned |
+| | Pinned (MEMORY.md) | Unpinned (memory/*.md) |
 |---|---|---|
 | **OpenClaw equivalent** | MEMORY.md | memory/*.md |
 | **Loaded into prompt** | Yes, every session | No |
 | **Reachable via search** | Yes | Yes |
-| **Size** | Small (dozens of entries) | Unbounded |
+| **Size** | Small (~4000 tokens max) | Unbounded |
 | **Content** | Permanent facts, core preferences | Daily observations, context, details |
-| **Who promotes** | Agent calls `pin_memory()` | Default state |
+| **How to promote** | Agent edits MEMORY.md | Agent moves line from daily log to MEMORY.md |
 
-**Prompt injection:** On every session start, pinned memories are loaded:
+**Prompt injection:** On every session start, contents of `MEMORY.md` are
+loaded verbatim:
 ```
-## Agent Memory (pinned)
-- Alice is VP of Ops, prefers Slack over email
+## Agent Memory
+The following are facts you have learned and saved as important.
+Refer to them as needed.
+
+- NDA clause 7 causes confusion during onboarding — explain proactively
+- Alice (VP Ops) prefers Slack, timezone US/Pacific
 - Company fiscal year starts April 1
-- NDA clause 7 causes confusion — proactively explain during onboarding
+- Staging environment uses Let's Encrypt certs, renewed quarterly
 ```
 
-### Agent Tools
+Capped at ~4000 tokens to avoid bloating the prompt. If `MEMORY.md` grows
+too large, the agent is prompted to curate it.
 
-```
-save_memory(
-    content: str,
-    category: str = "general",      # fact, preference, relationship,
-                                      # observation, procedural
-    related_to: str | None = None,   # "user:alice", "process:onboarding"
-    pinned: bool = False
-) -> { memory_id, content, category }
-```
-Creates a memory entry with embedding.
+### Agent Tools (reading only)
+
+Writing uses the existing `write`/`edit` tools. Only one memory-specific
+tool exists — for searching:
 
 ```
 memory_search(
     query: str,
-    category: str | None = None,
     limit: int = 6
-) -> [{ memory_id, content, category, related_entity, score, created_at }]
+) -> [{ content, file_path, score, created_at }]
 ```
 Hybrid search: vector similarity (70%) + keyword BM25 (30%).
 Searches across all memories for the agent (pinned and unpinned).
-
-```
-update_memory(
-    memory_id: str,
-    content: str | None = None,
-    category: str | None = None,
-    related_to: str | None = None
-) -> { memory_id, content, category }
-```
-Updates content and re-embeds.
-
-```
-pin_memory(memory_id: str) -> { memory_id, pinned: true }
-```
-Promotes a memory to always-loaded status.
-
-```
-forget_memory(memory_id: str) -> { memory_id, deleted: true }
-```
-Soft delete (or hard delete — memories have no expiry, agent manages lifecycle).
 
 ### Search Implementation
 
 Hybrid search combining vector similarity and keyword matching:
 
 ```python
-def memory_search(agent_id, query, category=None, limit=6):
+def memory_search(agent_id, query, limit=6):
     embedding = embed(query)
 
     # Vector candidates (4x limit for re-ranking)
     vector_hits = db.query("""
-        SELECT id, content, category, related_entity, created_at,
+        SELECT id, content, file_path, created_at,
                1 - (embedding <=> %s) AS vector_score
         FROM memories
         WHERE agent_id = %s AND deleted_at IS NULL
@@ -284,7 +317,7 @@ reply exceeded N characters, log it. Skip routine "hi"/"thanks" exchanges.
 
 14-day rolling window. Auto-pruned. The activity feed is short-term context,
 not permanent record. Important patterns should be promoted to agent memory
-by the heartbeat.
+by the heartbeat (by writing to memory files).
 
 ---
 
@@ -294,45 +327,41 @@ by the heartbeat.
 
 | Aspect | Strategy |
 |---|---|
-| **Reads at start** | Pinned memories loaded into prompt. `memory_search(user_name)` for user-specific context. |
-| **Writes during** | Agent-driven. Preferences, facts about the user. |
+| **Reads at start** | `MEMORY.md` loaded into prompt. `memory_search(user_name)` for user-specific context. |
+| **Writes during** | Agent writes to `memory/YYYY-MM-DD.md` — preferences, facts about the user. |
 | **Pre-compaction flush** | Yes — these accumulate across weeks of messages. |
 | **Activity feed** | Auto-logs substantive interactions. |
-| **System prompt guidance** | "When you learn something about this user, save it to memory." |
-| **Primary memory category** | relationship, preference |
+| **System prompt guidance** | "When you learn something about this user, write it to your memory files." |
 
 ### Heartbeat Session
 
 | Aspect | Strategy |
 |---|---|
-| **Reads at start** | Activity feed (since last tick) injected into prompt. Pinned memories loaded. |
-| **Writes during** | Cross-session observations, patterns, insights. |
+| **Reads at start** | Activity feed (since last tick) injected into prompt. `MEMORY.md` loaded. |
+| **Writes during** | Cross-session observations, patterns, insights to `memory/YYYY-MM-DD.md`. Promotes critical findings to `MEMORY.md`. |
 | **Pre-compaction flush** | Yes — accumulates across all ticks. |
 | **Activity feed** | Consumer, not producer. |
-| **System prompt guidance** | "Review recent activity. Use memory_search for deeper context. Save patterns you discover." |
-| **Primary memory category** | observation, procedural |
-| **Actions on insight** | Deliver message to channel, create_task, schedule_task, pin_memory |
+| **System prompt guidance** | "Review recent activity. Use memory_search for deeper context. Write patterns to memory files. Add critical insights to MEMORY.md." |
+| **Actions on insight** | Deliver message to channel, create_task, schedule_task |
 
 ### Execution Session
 
 | Aspect | Strategy |
 |---|---|
-| **Reads at start** | Pinned memories loaded. `memory_search(task_context)` for relevant facts. |
-| **Writes during** | Facts discovered during work. Procedural knowledge. |
+| **Reads at start** | `MEMORY.md` loaded. `memory_search(task_context)` for relevant facts. |
+| **Writes during** | Facts discovered during work to `memory/YYYY-MM-DD.md`. |
 | **Pre-compaction flush** | Yes — for long-running or multi-run executions. |
 | **Activity feed** | System-generated on completion (execution_completed event). |
-| **System prompt guidance** | "Search memory before starting work. Save important discoveries." |
-| **Primary memory category** | fact, procedural |
+| **System prompt guidance** | "Search memory before starting work. Write important discoveries to your memory files." |
 
 ### Scheduled Task Session (independent)
 
 | Aspect | Strategy |
 |---|---|
 | **Reads at start** | Same as execution. Prior fires visible in session history. |
-| **Writes during** | Cross-fire observations ("metric trending up since Monday"). |
+| **Writes during** | Cross-fire observations to `memory/YYYY-MM-DD.md` ("metric trending up since Monday"). |
 | **Pre-compaction flush** | Yes — session accumulates across many fires. |
 | **Activity feed** | System-generated on each fire completion. |
-| **Primary memory category** | fact, observation |
 
 ### Scheduled Task Session (notify/resume)
 
@@ -346,23 +375,27 @@ by the heartbeat.
 ## The Value Loop
 
 ```
-                   ┌─────────────────────────┐
-                   │     HEARTBEAT SESSION    │
-                   │  (the brain)            │
-                   │                          │
-                   │  Reads: activity feed    │
-                   │  Reads: memory_search    │
-                   │  Writes: save_memory     │
-                   │  Acts: deliver, create   │
-                   │        task, schedule    │
-                   └──────────┬───────────────┘
+                   ┌─────────────────────────────┐
+                   │     HEARTBEAT SESSION        │
+                   │  (the brain)                │
+                   │                              │
+                   │  Reads: activity feed        │
+                   │  Reads: memory_search        │
+                   │  Writes: MEMORY.md,          │
+                   │          memory/*.md          │
+                   │  Acts: deliver, create       │
+                   │        task, schedule        │
+                   └──────────┬───────────────────┘
                               │
             ┌─────────────────┼─────────────────┐
-            │ writes          │ reads            │ acts
+            │ writes files    │ reads            │ acts
             ↓                 ↓                  ↓
     ┌───────────────┐ ┌──────────────┐  ┌──────────────┐
-    │  MEMORY DB    │ │ MEMORY DB    │  │  TASK BOARD  │
-    │  (insights)   │ │ (insights)   │  │  (new work)  │
+    │  MEMORY FILES │ │ MEMORY DB    │  │  TASK BOARD  │
+    │  (sandbox)    │ │ (synced)     │  │  (new work)  │
+    │       ↓       │ │              │  │              │
+    │  post-run     │ │              │  │              │
+    │  sync → DB    │ │              │  │              │
     └───────┬───────┘ └──────────────┘  └──────┬───────┘
             │                                   │
             │ memory_search()                   │ worker picks up
@@ -397,33 +430,34 @@ by the heartbeat.
 Week 1:
   Execution "Onboard Bob"
     → Bob had questions about NDA clause 7
-    → Agent writes: save_memory("Bob struggled with NDA clause 7",
-        category="fact", related_to="user:bob")
+    → Agent writes to memory/2026-02-17.md:
+        "Bob struggled with NDA clause 7 during onboarding"
     → Activity feed: "Onboard Bob: completed, NDA required extra
         clarification on clause 7"
 
 Week 2:
   Execution "Onboard Carol"
     → Carol also got stuck on clause 7
-    → Agent writes: save_memory("Carol also confused by NDA clause 7",
-        category="fact", related_to="user:carol")
+    → Agent writes to memory/2026-02-23.md:
+        "Carol also confused by NDA clause 7 during onboarding"
     → Activity feed: "Onboard Carol: completed, NDA clause 7
         questions again"
 
   Heartbeat tick:
     → Reads activity feed: two NDA clause 7 issues in two weeks
     → memory_search("NDA clause 7") → finds Bob and Carol entries
-    → save_memory("NDA clause 7 repeatedly causes confusion during
-        onboarding. Proactively explain it in welcome emails.",
-        category="procedural", related_to="process:onboarding")
-    → pin_memory(new_id)  -- promote to always-loaded
+    → Writes to memory/2026-02-23.md:
+        "NDA clause 7 repeatedly causes confusion during onboarding.
+         Proactively explain it in welcome emails."
+    → Adds to MEMORY.md:
+        "- NDA clause 7 causes confusion — proactively explain during onboarding"
     → Delivers to #hr channel: "I've noticed NDA clause 7 confuses
         new hires. I'll start explaining it proactively."
 
 Week 3:
   Execution "Onboard Dave"
-    → System prompt includes pinned memory:
-      "NDA clause 7 repeatedly causes confusion — proactively explain"
+    → System prompt includes MEMORY.md content:
+      "NDA clause 7 causes confusion — proactively explain during onboarding"
     → Agent includes clause 7 explanation in welcome email
     → Dave doesn't get stuck
     → Activity feed: "Onboard Dave: completed smoothly"
@@ -435,14 +469,14 @@ The agent learned from its own experience. No human intervention needed.
 
 ## System Prompt Integration
 
-### Pinned Memories
+### MEMORY.md (Pinned Memories)
 
-Loaded into every session's system prompt:
+Loaded verbatim into every session's system prompt:
 
 ```
 ## Agent Memory
-The following are facts you have learned and pinned as important.
-Refer to them as needed.
+The following are facts you have learned and saved to MEMORY.md.
+Refer to them as needed. You can update MEMORY.md at any time.
 
 - NDA clause 7 causes confusion during onboarding — explain proactively
 - Alice (VP Ops) prefers Slack, timezone US/Pacific
@@ -450,20 +484,29 @@ Refer to them as needed.
 - Staging environment uses Let's Encrypt certs, renewed quarterly
 ```
 
-Capped at ~20 pinned entries / ~4000 tokens to avoid bloating the prompt.
-If the agent pins too many, oldest unpinned automatically (with a warning
-in the next session).
+Capped at ~4000 tokens. If `MEMORY.md` grows too large, the agent is
+prompted to curate it (remove stale entries, consolidate duplicates).
 
 ### Memory Recall Guidance
 
-Added to the system prompt when memory tools are available:
+Added to the system prompt for all sessions:
 
 ```
-## Memory Recall
-Before answering anything about prior work, decisions, dates, people,
-preferences, or processes: run memory_search first. Then use the
-results to inform your response. If nothing relevant found, proceed
-normally.
+## Memory
+You have a memory system with two tiers:
+- MEMORY.md: your curated knowledge (already loaded above).
+- memory/YYYY-MM-DD.md: daily logs (searchable via memory_search).
+
+**Reading:** Use memory_search(query) before answering anything about prior
+work, decisions, dates, people, preferences, or processes.
+
+**Writing:** Use the write tool to save memories:
+- Important/permanent facts → add to MEMORY.md
+- Daily observations/notes → write to memory/YYYY-MM-DD.md
+- To promote a fact → move it from daily log to MEMORY.md
+- To forget → remove the line from the file
+
+Create the memory/ directory if it doesn't exist.
 ```
 
 **Inspired by:** OpenClaw's `buildMemorySection()` in `system-prompt.ts`.
@@ -481,8 +524,11 @@ Review the activity above. Look for:
 - Opportunities to improve processes
 
 Use memory_search for deeper context on anything interesting.
-Save observations as memories. If something needs action, create
-a task or deliver a message to the relevant channel.
+Write observations to memory/YYYY-MM-DD.md. If you spot a pattern
+important enough to always remember, add it to MEMORY.md.
+
+If something needs action, create a task or deliver a message to
+the relevant channel.
 
 If nothing needs attention, reply HEARTBEAT_OK.
 ```
@@ -491,7 +537,7 @@ If nothing needs attention, reply HEARTBEAT_OK.
 
 ## Pre-Compaction Flush
 
-Same pattern as OpenClaw, adapted for DB storage.
+Same pattern as OpenClaw, adapted for file-based writing.
 
 ### Trigger
 
@@ -505,13 +551,14 @@ Default: fires when ~4000 tokens remain before compaction.
 1. Check: `memory_flush_compaction_count != compaction_count` (one flush
    per compaction cycle)
 2. Run silent agent turn with:
-   - System: "Session nearing compaction. Save durable facts using
-     save_memory."
-   - User: "Pre-compaction flush. Store important memories now. Reply
-     NO_REPLY if nothing to save."
-3. Agent calls `save_memory()` for durable facts
-4. Update `memory_flush_compaction_count = compaction_count`
-5. Compaction proceeds normally
+   - System: "Session nearing compaction. Write durable facts to your
+     memory files before context is compressed."
+   - User: "Pre-compaction flush. Write important memories to MEMORY.md
+     or memory/YYYY-MM-DD.md now. Reply NO_REPLY if nothing to save."
+3. Agent writes to memory files using `write` tool
+4. Post-turn sync persists changes to DB with embeddings
+5. Update `memory_flush_compaction_count = compaction_count`
+6. Compaction proceeds normally
 
 ### Which Sessions Get Flush
 
@@ -525,6 +572,90 @@ Default: fires when ~4000 tokens remain before compaction.
 
 ---
 
+## Post-Run Sync Details
+
+The sync runs after every agent turn that touches memory files. It bridges
+the file-based writing surface with the DB-backed search index.
+
+### Sync Flow
+
+```python
+def sync_memory_files(agent_id, org_id, session_id, sandbox_path):
+    """Run after every agent turn. Idempotent."""
+
+    # 1. Sync MEMORY.md → pinned entries
+    memory_md = read_file(sandbox_path / "MEMORY.md")
+    if memory_md:
+        entries = parse_memory_entries(memory_md)  # split by line/block
+        existing = db.query(
+            "SELECT id, content, line_hash FROM memories "
+            "WHERE agent_id = %s AND file_path = 'MEMORY.md'",
+            agent_id
+        )
+        diff = compute_diff(existing, entries)
+        for entry in diff.added:
+            db.insert(memories, agent_id=agent_id, org_id=org_id,
+                      content=entry, file_path="MEMORY.md",
+                      line_hash=sha256(entry), pinned=True,
+                      source_session_id=session_id)
+        for entry in diff.removed:
+            db.update(memories, id=entry.id, pinned=False)
+        for entry in diff.changed:
+            db.update(memories, id=entry.id, content=entry.new_content,
+                      line_hash=sha256(entry.new_content))
+
+    # 2. Sync memory/*.md → unpinned entries
+    for file in glob(sandbox_path / "memory/*.md"):
+        file_path = f"memory/{file.name}"
+        content = read_file(file)
+        entries = parse_memory_entries(content)
+        existing = db.query(
+            "SELECT id, content, line_hash FROM memories "
+            "WHERE agent_id = %s AND file_path = %s",
+            agent_id, file_path
+        )
+        diff = compute_diff(existing, entries)
+        for entry in diff.added:
+            db.insert(memories, agent_id=agent_id, org_id=org_id,
+                      content=entry, file_path=file_path,
+                      line_hash=sha256(entry), pinned=False,
+                      source_session_id=session_id)
+        for entry in diff.changed:
+            db.update(memories, id=entry.id, content=entry.new_content,
+                      line_hash=sha256(entry.new_content))
+
+    # 3. Batch embed all new/changed entries
+    pending = db.query(
+        "SELECT id, content FROM memories "
+        "WHERE agent_id = %s AND embedding IS NULL",
+        agent_id
+    )
+    if pending:
+        embeddings = batch_embed([e.content for e in pending])
+        for entry, emb in zip(pending, embeddings):
+            db.update(memories, id=entry.id, embedding=emb)
+```
+
+### Parse Strategy
+
+`MEMORY.md` entries are parsed as individual bullet points or paragraph
+blocks. `memory/*.md` entries are parsed as paragraph blocks (separated by
+blank lines). This gives the agent flexibility in how it structures notes
+while keeping each entry small enough for meaningful vector search.
+
+### Sandbox File Seeding
+
+On session start, the memory files are seeded into the sandbox from the DB:
+
+1. Query pinned entries → write to `MEMORY.md`
+2. Query recent unpinned entries for the current date → write to
+   `memory/YYYY-MM-DD.md`
+
+This means the agent always sees its latest memories as real files it can
+read and edit. The files are the interface; the DB is the backing store.
+
+---
+
 ## Component Map
 
 | Component | File | Role |
@@ -532,12 +663,14 @@ Default: fires when ~4000 tokens remain before compaction.
 | Memory model | `memory/models.py` | `Memory` SQLAlchemy table |
 | Memory repository | `memory/repository.py` | CRUD + vector search |
 | Memory service | `memory/service.py` | Business logic, embedding, search |
-| Memory tools | `agent/tools/memory.py` | 5 agent tools (save, search, update, pin, forget) |
+| Memory search tool | `agent/tools/memory.py` | 1 agent tool (search only) |
+| Post-run sync | `memory/sync.py` | File → DB sync after agent turns |
+| Sandbox seeder | `memory/seed.py` | DB → file seeding on session start |
 | Activity feed model | `memory/models.py` | `ActivityFeed` table |
 | Activity feed writer | `memory/activity.py` | System-generated event logging |
 | Activity feed pruner | `memory/activity.py` | 14-day retention sweep |
 | Pre-compaction flush | `worker/memory_flush.py` | Silent turn before compaction |
-| Pinned memory loader | `agent/prompt.py` | Load pinned memories into system prompt |
+| Pinned memory loader | `agent/prompt.py` | Load MEMORY.md into system prompt |
 | Embedding service | `memory/embedding.py` | pgvector embedding generation |
 
 ---
@@ -556,8 +689,7 @@ class MemoryConfig:
     search_vector_weight: float = 0.7
     search_text_weight: float = 0.3
 
-    # Pinned
-    max_pinned: int = 20
+    # Pinned (MEMORY.md)
     max_pinned_tokens: int = 4000
 
     # Activity feed
@@ -568,6 +700,10 @@ class MemoryConfig:
     flush_enabled: bool = True
     flush_soft_threshold_tokens: int = 4000
     flush_reserve_floor_tokens: int = 20000
+
+    # Post-run sync
+    sync_enabled: bool = True
+    sync_batch_embed_size: int = 50
 ```
 
 ---
