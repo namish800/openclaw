@@ -81,6 +81,33 @@ them around the cache boundary (`src/agents/system-prompt.ts:918-924`).
   basenames in `DYNAMIC_CONTEXT_FILE_BASENAMES`
   (`src/agents/system-prompt.ts:57`). Currently: `heartbeat.md`.
 
+### HEARTBEAT.md gating
+
+HEARTBEAT.md is *eligible* every session but the upstream
+`resolveBootstrapFilesForRun` (`src/agents/bootstrap-files.ts:194-227`) will
+strip it from `contextFiles` unless one of these holds:
+
+- `runKind === "heartbeat"` (a heartbeat-triggered run), or
+- the session agent is *not* the default agent, or
+- `shouldIncludeHeartbeatGuidanceForSystemPrompt` returns true — i.e. the
+  default agent has heartbeats enabled by agent policy, `heartbeat.every`
+  parses to a positive cadence, and `heartbeat.includeSystemPromptSection` is
+  not `false` (`src/agents/heartbeat-system-prompt.ts:54-72`).
+
+Lightweight context mode (`applyContextModeFilter`,
+`src/agents/bootstrap-files.ts:177-192`) further reduces heartbeat runs to
+*only* HEARTBEAT.md, dropping AGENTS/SOUL/USER/etc.
+
+The separate `## Heartbeats` system-prompt block (driven by `heartbeatPrompt`,
+`src/agents/system-prompt.ts:130-141`) is gated even tighter for the embedded
+runner: it is injected only when `trigger === "heartbeat"` and the agent is
+the default agent (`shouldInjectHeartbeatPrompt` in
+`src/agents/pi-embedded-runner/run/attempt.prompt-helpers.ts:213-231`,
+`shouldInjectHeartbeatPromptForTrigger` in
+`src/agents/pi-embedded-runner/run/trigger-policy.ts:11-22`). The CLI runner
+path (`src/agents/cli-runner/prepare.ts:279`) does not gate by trigger and
+includes the section whenever heartbeat policy/cadence are enabled.
+
 ### Stable File Ordering
 
 `CONTEXT_FILE_ORDER` (`src/agents/system-prompt.ts:47-55`) defines a fixed sort
